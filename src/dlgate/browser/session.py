@@ -58,6 +58,10 @@ class BrowserSession:
             "slow_mo": self._config.slow_mo,
             "viewport": {"width": 1280, "height": 900},
             "accept_downloads": True,
+            "args": [
+                "--disable-blink-features=AutomationControlled",
+            ],
+            "ignore_default_args": ["--enable-automation"],
         }
         if self._config.channel:
             launch_kwargs["channel"] = self._config.channel
