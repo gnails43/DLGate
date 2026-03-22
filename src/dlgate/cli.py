@@ -123,41 +123,41 @@ async def _check(config_path: str) -> None:
     config = Config.load(config_path)
     config.ensure_dirs()
 
-    checks = [
-        ("https://soundcloud.com/you/library", "SoundCloud",
-         "document.querySelector('a[href*=\"/you\"], .header__userNavUsernameButton, .userNav__username')?.textContent?.trim() || ''"),
-        ("https://open.spotify.com", "Spotify",
-         "document.querySelector('[data-testid=\"user-widget-link\"], button[data-testid=\"user-widget-link\"]')?.textContent?.trim() || ''"),
-        ("https://www.instagram.com", "Instagram",
-         "document.querySelector('img[data-testid=\"user-avatar\"], span._aacl._aacn')?.alt || document.querySelector('a[href*=\"/accounts/\"]') ? '' : (document.querySelector('svg[aria-label=\"Home\"]') ? 'logged in' : '')"),
-        ("https://www.tiktok.com", "TikTok",
-         "document.querySelector('[data-e2e=\"profile-icon\"], .avatar-anchor')?.href ? 'logged in' : ''"),
-        ("https://www.youtube.com", "YouTube",
-         "document.querySelector('#avatar-btn, button#avatar-btn')? 'logged in' : ''"),
+    # Check login by looking for auth cookies per domain
+    cookie_checks = [
+        ("SoundCloud", [".soundcloud.com"], ["sc_anonymous_id", "oauth_token"]),
+        ("Spotify", [".spotify.com"], ["sp_dc", "sp_key"]),
+        ("Instagram", [".instagram.com"], ["sessionid", "ds_user_id"]),
+        ("TikTok", [".tiktok.com"], ["sessionid", "sid_tt", "sessionid_ss"]),
+        ("YouTube", [".youtube.com", ".google.com"], ["SID", "SSID", "LOGIN_INFO"]),
     ]
 
     console.print("[bold]Checking login status...[/bold]")
     console.print()
 
     async with BrowserSession(config.browser) as session:
-        page = session.page
+        cookies = await session.context.cookies()
 
-        for url, name, js_check in checks:
-            try:
-                await page.goto(url, wait_until="domcontentloaded", timeout=15000)
-                await page.wait_for_timeout(3000)
-                result = await page.evaluate(js_check)
-                if result:
-                    console.print(f"  [bold green]OK[/bold green]  {name} ({result})")
+        for name, domains, auth_cookie_names in cookie_checks:
+            # Find cookies matching this service's domains
+            service_cookies = [
+                c for c in cookies
+                if any(c["domain"].endswith(d.lstrip(".")) or c["domain"] == d for d in domains)
+            ]
+            # Check if any auth cookies exist
+            found_auth = [
+                c["name"] for c in service_cookies
+                if c["name"] in auth_cookie_names
+            ]
+
+            if found_auth:
+                console.print(f"  [bold green]OK[/bold green]  {name}")
+            else:
+                cookie_names = [c["name"] for c in service_cookies[:5]]
+                if service_cookies:
+                    console.print(f"  [bold red]NG[/bold red]  {name} (no auth cookie found)")
                 else:
-                    # Check if redirected to login page
-                    current_url = page.url
-                    if "login" in current_url or "signin" in current_url or "accounts" in current_url:
-                        console.print(f"  [bold red]NG[/bold red]  {name} (not logged in)")
-                    else:
-                        console.print(f"  [yellow]??[/yellow]  {name} (could not determine)")
-            except Exception as e:
-                console.print(f"  [yellow]??[/yellow]  {name} (error: {e})")
+                    console.print(f"  [bold red]NG[/bold red]  {name} (no cookies)")
 
     console.print()
     console.print("Run [bold]dlgate setup <service>[/bold] to log in to specific services.")
