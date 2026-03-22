@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 import re
 from typing import Optional
+from urllib.parse import parse_qs, unquote, urlparse
 
 from playwright.async_api import Page
 
@@ -15,6 +16,8 @@ GATE_PATTERNS = [
     re.compile(r"https?://(?:www\.)?fanlink\.to/\S+", re.IGNORECASE),
     re.compile(r"https?://(?:www\.)?gate\.fm/\S+", re.IGNORECASE),
     re.compile(r"https?://(?:www\.)?distrokid\.com/hyperfollow/\S+", re.IGNORECASE),
+    # SoundCloud external link wrapper
+    re.compile(r"https?://gate\.sc/\?url=\S+", re.IGNORECASE),
     # Link aggregators (may contain free DL links)
     re.compile(r"https?://linktr\.ee/\S+", re.IGNORECASE),
     re.compile(r"https?://(?:www\.)?lnk\.to/\S+", re.IGNORECASE),
@@ -23,6 +26,25 @@ GATE_PATTERNS = [
     re.compile(r"https?://(?:www\.)?push\.fm/\S+", re.IGNORECASE),
     re.compile(r"https?://(?:www\.)?smarturl\.it/\S+", re.IGNORECASE),
 ]
+
+# Pattern for bare domain references (no http/https) in description text
+BARE_GATE_PATTERN = re.compile(r"(?<!\S)hypeddit\.com/\S+", re.IGNORECASE)
+
+
+def _unwrap_gate_sc(url: str) -> str:
+    """Unwrap gate.sc wrapper URLs to get the actual gate URL.
+
+    gate.sc/?url=https%3A%2F%2Fhypeddit.com%2F... → https://hypeddit.com/...
+    """
+    if "gate.sc" not in url:
+        return url
+    parsed = urlparse(url)
+    params = parse_qs(parsed.query)
+    if "url" in params:
+        unwrapped = unquote(params["url"][0])
+        logger.info("Unwrapped gate.sc: %s", unwrapped)
+        return unwrapped
+    return url
 
 
 async def detect_gate_url(page: Page, track_url: str) -> Optional[str]:
@@ -95,14 +117,18 @@ async def _check_buy_button(page: Page) -> Optional[str]:
         return null;
     }""")
 
-    if href and _is_gate_url(href):
-        return href
+    if href:
+        # Unwrap gate.sc wrapper URLs
+        href = _unwrap_gate_sc(href)
 
-    # Even if not a known gate URL, if it's an external link from the buy button
-    # it might redirect to a gate. Return it for further processing.
-    if href and not href.startswith("https://soundcloud.com"):
-        logger.info("Buy button links to external URL: %s", href)
-        return href
+        if _is_gate_url(href):
+            return href
+
+        # Even if not a known gate URL, if it's an external link from the buy button
+        # it might redirect to a gate. Return it for further processing.
+        if not href.startswith("https://soundcloud.com"):
+            logger.info("Buy button links to external URL: %s", href)
+            return href
 
     return None
 
@@ -148,8 +174,9 @@ async def _check_all_links_js(page: Page) -> Optional[str]:
     }""")
 
     for href in links:
-        if _is_gate_url(href):
-            return href
+        unwrapped = _unwrap_gate_sc(href)
+        if _is_gate_url(unwrapped):
+            return unwrapped
     return None
 
 
@@ -158,7 +185,16 @@ def _find_gate_url_in_text(text: str) -> Optional[str]:
     for pattern in GATE_PATTERNS:
         match = pattern.search(text)
         if match:
-            return match.group(0).rstrip(".,;:!?)")
+            url = match.group(0).rstrip(".,;:!?)")
+            return _unwrap_gate_sc(url)
+
+    # Also check for bare domain references (no http prefix)
+    match = BARE_GATE_PATTERN.search(text)
+    if match:
+        bare_url = "https://" + match.group(0).rstrip(".,;:!?)")
+        logger.info("Found bare gate URL in text: %s", bare_url)
+        return bare_url
+
     return None
 
 

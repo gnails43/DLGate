@@ -95,6 +95,7 @@ class HypedditHandler(BaseGateHandler):
     async def process(self, page: Page, track: Track, config: Config) -> GateResult:
         result = GateResult(track=track)
         gate_url = track.gate_url or track.url
+        self._retried_download = False
 
         try:
             logger.info("Processing Hypeddit gate: %s", gate_url)
@@ -151,26 +152,30 @@ class HypedditHandler(BaseGateHandler):
                 if screen == "landing":
                     await self._click_initial_download(page)
                     await random_delay(1000, 2000)
-                    await self._advance_slide(page)
+                    if not await self._wait_for_auto_advance(page, screen):
+                        await self._advance_slide(page)
                     await random_delay(1000, 2000)
 
                 elif screen == "email":
                     await self._handle_email(page, config)
                     result.steps_completed.append(GateStepType.EMAIL)
-                    await self._advance_slide(page)
+                    if not await self._wait_for_auto_advance(page, screen):
+                        await self._advance_slide(page)
                     await random_delay(1000, 2000)
 
                 elif screen == "soundcloud":
                     await self._handle_soundcloud(page, config)
                     result.steps_completed.append(GateStepType.SOUNDCLOUD_OAUTH)
-                    await self._advance_slide(page)
+                    if not await self._wait_for_auto_advance(page, screen):
+                        await self._advance_slide(page)
                     await random_delay(2000, 3000)
 
                 elif screen in ("instagram", "tiktok", "spotify", "youtube",
                                 "facebook", "twitter", "apple_music"):
                     await self._handle_social_step(page, screen)
                     result.steps_completed.append(GateStepType.SOCIAL_LINK)
-                    await self._advance_slide(page)
+                    if not await self._wait_for_auto_advance(page, screen):
+                        await self._advance_slide(page)
                     await random_delay(1000, 2000)
 
                 elif screen == "download_ready":
@@ -179,12 +184,28 @@ class HypedditHandler(BaseGateHandler):
                         result.status = ProcessStatus.SUCCESS
                         result.download_path = download_path
                         result.steps_completed.append(GateStepType.DOWNLOAD)
+                        await take_screenshot(page, f"{step_num:02d}_download_result")
+                        self._dump_api_log()
+                        return result
+
+                    # Download failed - try reloading the gate page once to get
+                    # server-side state and retry with actual incomplete steps.
+                    if not getattr(self, '_retried_download', False):
+                        self._retried_download = True
+                        logger.info("Download failed, reloading gate to check server state")
+                        await page.goto(gate_url, wait_until="domcontentloaded")
+                        await random_delay(2000, 3000)
+                        await self._dismiss_cookies(page)
+                        await self._click_initial_download(page)
+                        await random_delay(3000, 5000)
+                        prev_screen = None
+                        # Continue the loop
                     else:
                         result.status = ProcessStatus.FAILED
-                        result.error_message = "Download failed"
-                    await take_screenshot(page, f"{step_num:02d}_download_result")
-                    self._dump_api_log()
-                    return result
+                        result.error_message = "Download failed (after retry)"
+                        await take_screenshot(page, f"{step_num:02d}_download_result")
+                        self._dump_api_log()
+                        return result
 
                 elif screen in ("unknown", "unknown_slide"):
                     logger.warning("Unknown screen state, trying to proceed")
@@ -850,6 +871,21 @@ class HypedditHandler(BaseGateHandler):
         new_state = await detect_screen_state(page)
         if new_state["screen"] != platform:
             logger.info("Step auto-advanced to: %s", new_state["screen"])
+
+    async def _wait_for_auto_advance(self, page: Page, current_screen: str, max_checks: int = 5) -> bool:
+        """Wait for the page's own JS to auto-advance the slide after a step action.
+
+        Returns True if the slide auto-advanced (server-side), False if still stuck.
+        """
+        for i in range(max_checks):
+            await random_delay(2000, 3000)
+            new_state = await detect_screen_state(page)
+            if new_state["screen"] != current_screen:
+                logger.info("Auto-advanced: %s -> %s (after %d checks)",
+                            current_screen, new_state["screen"], i + 1)
+                return True
+        logger.info("No auto-advance from '%s' after %d checks", current_screen, max_checks)
+        return False
 
     async def _advance_slide(self, page: Page) -> bool:
         """Advance to the next slide using server-side API calls.
