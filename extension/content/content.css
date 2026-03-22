@@ -32,6 +32,10 @@
   transform: none;
 }
 
+.dlgate-btn-feed {
+  margin-left: 4px;
+}
+
 .dlgate-btn-fixed {
   position: fixed;
   top: 12px;

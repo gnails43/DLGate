@@ -10,6 +10,11 @@ from dlgate.config import Config
 from dlgate.gates import get_handler
 from dlgate.models import GateResult, ProcessStatus, Track, TrackType
 from dlgate.scraper.gate_detector import detect_gate_url
+from dlgate.scraper.link_aggregator import (
+    is_aggregator_url,
+    is_unsupported_platform,
+    resolve_aggregator,
+)
 from dlgate.scraper.soundcloud import get_track_title_artist
 
 logger = logging.getLogger(__name__)
@@ -95,6 +100,27 @@ async def process_single_track(session: BrowserSession, track: Track, config: Co
     # If it's a Hypeddit URL directly, set gate_url
     if track.track_type == TrackType.HYPEDDIT and not track.gate_url:
         track.gate_url = track.url
+
+    # Check if the gate URL is an unsupported platform (Beatport, etc.)
+    if track.gate_url and is_unsupported_platform(track.gate_url):
+        return GateResult(
+            track=track,
+            status=ProcessStatus.SKIPPED,
+            error_message=f"Unsupported platform (paid store): {track.gate_url}",
+        )
+
+    # Check if the gate URL is a link aggregator (Linktree, etc.)
+    if track.gate_url and is_aggregator_url(track.gate_url):
+        logger.info("Detected link aggregator, resolving: %s", track.gate_url)
+        resolved_url = await resolve_aggregator(page, track.gate_url)
+        if not resolved_url:
+            return GateResult(
+                track=track,
+                status=ProcessStatus.SKIPPED,
+                error_message=f"No free download link found on aggregator page: {track.gate_url}",
+            )
+        logger.info("Resolved to gate URL: %s", resolved_url)
+        track.gate_url = resolved_url
 
     # Find the right handler
     handler = get_handler(track.gate_url)

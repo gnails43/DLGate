@@ -15,6 +15,13 @@ GATE_PATTERNS = [
     re.compile(r"https?://(?:www\.)?fanlink\.to/\S+", re.IGNORECASE),
     re.compile(r"https?://(?:www\.)?gate\.fm/\S+", re.IGNORECASE),
     re.compile(r"https?://(?:www\.)?distrokid\.com/hyperfollow/\S+", re.IGNORECASE),
+    # Link aggregators (may contain free DL links)
+    re.compile(r"https?://linktr\.ee/\S+", re.IGNORECASE),
+    re.compile(r"https?://(?:www\.)?lnk\.to/\S+", re.IGNORECASE),
+    re.compile(r"https?://(?:www\.)?ffm\.to/\S+", re.IGNORECASE),
+    re.compile(r"https?://(?:www\.)?orcd\.co/\S+", re.IGNORECASE),
+    re.compile(r"https?://(?:www\.)?push\.fm/\S+", re.IGNORECASE),
+    re.compile(r"https?://(?:www\.)?smarturl\.it/\S+", re.IGNORECASE),
 ]
 
 
