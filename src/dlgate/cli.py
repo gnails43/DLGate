@@ -4,6 +4,10 @@ import asyncio
 import logging
 import sys
 
+# Windows requires ProactorEventLoop for subprocess support (Playwright)
+if sys.platform == "win32":
+    asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
+
 import click
 from rich.console import Console
 from rich.logging import RichHandler

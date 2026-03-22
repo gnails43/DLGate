@@ -2,14 +2,11 @@ from __future__ import annotations
 
 import logging
 import random
-import re
 
 from playwright.async_api import Page
 
 from dlgate.browser.actions import (
     random_delay,
-    safe_click,
-    safe_fill,
     take_screenshot,
     wait_for_download,
     wait_for_new_page,
@@ -19,6 +16,42 @@ from dlgate.gates.base import BaseGateHandler
 from dlgate.models import GateResult, GateStepType, ProcessStatus, Track
 
 logger = logging.getLogger(__name__)
+
+# Mapping from steps_select tokens to step handler names
+STEP_MAP = {
+    "email": "email",
+    "sc": "soundcloud",
+    "ig": "instagram",
+    "tk": "tiktok",
+    "sp": "spotify",
+    "yt": "youtube",
+    "fb": "facebook",
+    "tw": "twitter",
+    "am": "apple_music",
+    "dw": "download",
+}
+
+
+async def js_fill(page: Page, selector: str, value: str) -> bool:
+    """Fill an input using JavaScript (bypasses visibility checks)."""
+    return await page.evaluate(f"""() => {{
+        const el = document.querySelector('{selector}');
+        if (!el) return false;
+        el.value = {repr(value)};
+        el.dispatchEvent(new Event('input', {{bubbles: true}}));
+        el.dispatchEvent(new Event('change', {{bubbles: true}}));
+        return true;
+    }}""")
+
+
+async def js_click(page: Page, selector: str) -> bool:
+    """Click an element using JavaScript (bypasses visibility checks)."""
+    return await page.evaluate(f"""() => {{
+        const el = document.querySelector('{selector}');
+        if (!el) return false;
+        el.click();
+        return true;
+    }}""")
 
 
 class HypedditHandler(BaseGateHandler):
@@ -32,10 +65,10 @@ class HypedditHandler(BaseGateHandler):
         try:
             logger.info("Processing Hypeddit gate: %s", gate_url)
             await page.goto(gate_url, wait_until="domcontentloaded")
-            await page.wait_for_selector(".fangate-slider-content", timeout=15000)
+            await page.wait_for_selector(".fangate-slider-content", state="attached", timeout=15000)
             await random_delay(1000, 2000)
 
-            # Determine which steps are present
+            # Read steps from #steps_select
             steps = await self._detect_steps(page)
             logger.info("Detected steps: %s", steps)
 
@@ -54,6 +87,8 @@ class HypedditHandler(BaseGateHandler):
                                   "facebook", "apple_music", "twitter"):
                         await self._handle_social_link(page, step)
                         result.steps_completed.append(GateStepType.SOCIAL_LINK)
+                    elif step == "download":
+                        continue
                     await random_delay()
                 except Exception as e:
                     logger.warning("Step '%s' failed: %s", step, e)
@@ -81,282 +116,220 @@ class HypedditHandler(BaseGateHandler):
         return result
 
     async def _detect_steps(self, page: Page) -> list[str]:
-        """Detect which steps the gate requires by reading #steps_select or scanning the DOM."""
-        steps = []
-
-        # Try reading the steps_select hidden input
+        """Detect steps from #steps_select hidden input."""
         steps_value = await page.evaluate(
             "document.getElementById('steps_select')?.value || ''"
         )
+        if not steps_value:
+            logger.warning("No steps_select found")
+            return []
 
-        if steps_value:
-            logger.debug("steps_select value: %s", steps_value)
-            # Parse the comma-separated step identifiers
-            raw_steps = [s.strip().lower() for s in steps_value.split(",") if s.strip()]
-            for s in raw_steps:
-                if "email" in s or "mail" in s:
-                    steps.append("email")
-                elif "soundcloud" in s or "sc" in s:
-                    steps.append("soundcloud")
-                elif "comment" in s:
-                    steps.append("comment")
-                elif "spotify" in s or "sp" in s:
-                    steps.append("spotify")
-                elif "instagram" in s or "insta" in s or "ig" in s:
-                    steps.append("instagram")
-                elif "tiktok" in s or "tik" in s:
-                    steps.append("tiktok")
-                elif "youtube" in s or "yt" in s:
-                    steps.append("youtube")
-                elif "facebook" in s or "fb" in s:
-                    steps.append("facebook")
-                elif "apple" in s:
-                    steps.append("apple_music")
-                elif "twitter" in s or "x" == s:
-                    steps.append("twitter")
-                else:
-                    logger.debug("Unknown step identifier: %s", s)
-            return steps
-
-        # Fallback: scan the DOM for step indicators
-        logger.debug("No steps_select found, scanning DOM")
-        if await page.query_selector("#email_address, #download_email_address"):
-            steps.append("email")
-        if await page.query_selector("[class*='soundcloud'], [onclick*='connect']"):
-            steps.append("soundcloud")
-        if await page.query_selector("[class*='comment'], textarea"):
-            steps.append("comment")
-        if await page.query_selector("[class*='spotify'], #login_sp"):
-            steps.append("spotify")
-        if await page.query_selector("[class*='instagram']"):
-            steps.append("instagram")
-        if await page.query_selector("[class*='tiktok']"):
-            steps.append("tiktok")
-        if await page.query_selector("[class*='youtube']"):
-            steps.append("youtube")
-
+        logger.debug("steps_select value: %s", steps_value)
+        steps = []
+        for token in steps_value.split(","):
+            token = token.strip().lower()
+            if token in STEP_MAP:
+                steps.append(STEP_MAP[token])
+            else:
+                logger.debug("Unknown step token: %s", token)
         return steps
 
     async def _handle_email(self, page: Page, config: Config) -> None:
         logger.info("Filling email form")
 
-        # Wait for the email step to be the current slide
-        await self._wait_for_current_step(page)
+        # Fill name
+        if await js_fill(page, "#email_name", config.user.name):
+            logger.info("Filled name: %s", config.user.name)
 
-        # Try different email input selectors
-        for selector in ["#email_address", "#download_email_address",
-                         "input[type='email']", "input[name='email']"]:
-            if await safe_fill(page, selector, config.user.email, timeout=3000):
-                break
+        # Fill email
+        if await js_fill(page, "#email_address", config.user.email):
+            logger.info("Filled email: %s", config.user.email)
 
-        # Try filling name if present
-        for selector in ["input[name='name']", "input[placeholder*='name' i]",
-                         "input[placeholder*='Name']"]:
-            if await safe_fill(page, selector, config.user.name, timeout=2000):
-                break
-
-        # Click submit/next
-        await self._click_next_or_submit(page)
+        # Click submit
+        if await js_click(page, "#email_to_downloads_next"):
+            logger.info("Clicked email submit")
+            await random_delay(2000, 4000)
+        else:
+            logger.warning("Email submit button not found")
 
     async def _handle_soundcloud_oauth(self, page: Page) -> None:
         logger.info("Handling SoundCloud OAuth")
-        await self._wait_for_current_step(page)
 
-        # Look for the SoundCloud connect button
-        sc_selectors = [
-            "button[class*='soundcloud']",
-            "a[class*='soundcloud']",
-            "[onclick*='connect']",
-            ".hy-btn-soundcloud",
-            "button:has-text('SoundCloud')",
-            "a:has-text('SoundCloud')",
-        ]
+        # Find the SC step's connect button via JS and click it
+        # The connect button triggers a popup for OAuth
+        clicked = await page.evaluate("""() => {
+            const scStep = document.querySelector('.fangate-slider-content.sc');
+            if (!scStep) return false;
+            const btn = scStep.querySelector('a.hype-btn-green, a.hype-btn, button.hype-btn');
+            if (!btn) return false;
+            btn.click();
+            return true;
+        }""")
 
-        for selector in sc_selectors:
-            btn = await page.query_selector(selector)
-            if btn and await btn.is_visible():
-                # Click opens OAuth popup
-                new_page = await wait_for_new_page(
-                    page.context,
-                    btn.click(),
-                    timeout=60000,
-                )
+        if clicked:
+            logger.info("Clicked SoundCloud connect button")
+            # Wait for possible OAuth popup
+            try:
+                new_page = await page.context.wait_for_event("page", timeout=10000)
                 if new_page:
-                    # Wait for OAuth to complete (popup closes or redirects)
+                    await new_page.wait_for_load_state("domcontentloaded")
+                    logger.info("SoundCloud OAuth popup opened")
                     try:
                         await new_page.wait_for_event("close", timeout=60000)
                     except Exception:
-                        # If popup didn't close, try clicking authorize
                         try:
-                            await safe_click(new_page, "button[type='submit'], .authorize", timeout=5000)
-                            await new_page.wait_for_event("close", timeout=30000)
+                            await new_page.close()
                         except Exception:
-                            logger.warning("OAuth popup did not close automatically")
-                            try:
-                                await new_page.close()
-                            except Exception:
-                                pass
-
-                await random_delay(1000, 3000)
-
-                # Check if we need to click next after OAuth
-                await self._click_next_or_submit(page, required=False)
-                return
-
-        logger.warning("SoundCloud OAuth button not found")
+                            pass
+            except Exception:
+                logger.info("No OAuth popup (may already be authorized)")
+            await random_delay(2000, 4000)
+        else:
+            logger.warning("SoundCloud connect button not found")
 
     async def _handle_comment(self, page: Page, config: Config) -> None:
         logger.info("Writing comment")
-        await self._wait_for_current_step(page)
-
         comment = random.choice(config.comments)
-        logger.info("Using comment: %s", comment)
 
-        comment_selectors = [
-            "textarea",
-            "input[placeholder*='comment' i]",
-            "input[placeholder*='Comment']",
-            "[class*='comment'] input",
-            "[class*='comment'] textarea",
-        ]
-
-        for selector in comment_selectors:
-            if await safe_fill(page, selector, comment, timeout=3000):
-                break
-
-        await self._click_next_or_submit(page)
+        await page.evaluate(f"""() => {{
+            const ta = document.querySelector('textarea, input[name*="comment"]');
+            if (ta) {{
+                ta.value = {repr(comment)};
+                ta.dispatchEvent(new Event('input', {{bubbles: true}}));
+            }}
+            const btn = document.querySelector('.current-slide button.hype-btn-green, .current-slide .hype-btn');
+            if (btn) btn.click();
+        }}""")
+        logger.info("Comment submitted: %s", comment)
+        await random_delay(1500, 3000)
 
     async def _handle_social_link(self, page: Page, platform: str) -> None:
         logger.info("Handling social link: %s", platform)
-        await self._wait_for_current_step(page)
 
-        # Find all social buttons for this platform in the current step
-        current_slide = await page.query_selector(".current-slide, .fangate-slider-content:not(.move-left)")
-        if not current_slide:
-            current_slide = page
-
-        # Look for buttons related to this platform
-        platform_selectors = {
-            "spotify": ["[class*='spotify']", "#login_sp", "a[href*='spotify']"],
-            "instagram": ["[class*='instagram']", "a[href*='instagram']"],
-            "tiktok": ["[class*='tiktok']", "a[href*='tiktok']"],
-            "youtube": ["[class*='youtube']", "a[href*='youtube']"],
-            "facebook": ["[class*='facebook']", "a[href*='facebook']"],
-            "apple_music": ["#apple-music-authorize", "[class*='apple']"],
-            "twitter": ["[class*='twitter']", "[class*='x-']", "a[href*='twitter']", "a[href*='x.com']"],
+        platform_config = {
+            "instagram": "ig",
+            "tiktok": "tk",
+            "spotify": "sp",
+            "youtube": "yt",
+            "facebook": "fb",
+            "twitter": "tw",
+            "apple_music": "am",
         }
+        step_class = platform_config.get(platform, platform)
 
-        selectors = platform_selectors.get(platform, [f"[class*='{platform}']"])
+        # Get all action links in this step (excluding Next buttons)
+        action_links = await page.evaluate(f"""() => {{
+            const step = document.querySelector('.fangate-slider-content.{step_class}');
+            if (!step) return [];
+            const form = step.querySelector('#step_{step_class}');
+            if (!form) return [];
+            // Find all action buttons/links (not Next)
+            const links = form.querySelectorAll('a.hype-btn, button.hype-btn');
+            const result = [];
+            for (const link of links) {{
+                const text = link.textContent.trim();
+                const id = link.id || '';
+                if (id.includes('skipper') || text.toLowerCase() === 'next') continue;
+                result.push({{
+                    tag: link.tagName,
+                    text: text.substring(0, 60),
+                    href: link.href || '',
+                    id: id,
+                    hasOnclick: !!link.onclick,
+                }});
+            }}
+            return result;
+        }}""")
 
-        # Find all action buttons in the current slide
-        buttons = []
-        for sel in selectors:
-            found = await current_slide.query_selector_all(sel)
-            for el in found:
-                if await el.is_visible():
-                    tag = await el.evaluate("el => el.tagName.toLowerCase()")
-                    if tag in ("a", "button") or await el.get_attribute("onclick"):
-                        buttons.append(el)
+        logger.info("Found %d %s action(s)", len(action_links), platform)
 
-        if not buttons:
-            # Try broader search - all visible buttons/links in current step
-            all_btns = await current_slide.query_selector_all(".all-buttons a, .all-buttons button, .step_button a, .step_button button")
-            for el in all_btns:
-                if await el.is_visible():
-                    buttons.append(el)
+        for i, link_info in enumerate(action_links):
+            logger.debug("  Action %d: %s", i, link_info.get("text", ""))
+            # Click the action link via JS
+            clicked = await page.evaluate(f"""() => {{
+                const step = document.querySelector('.fangate-slider-content.{step_class}');
+                const form = step?.querySelector('#step_{step_class}');
+                if (!form) return false;
+                const links = form.querySelectorAll('a.hype-btn, button.hype-btn');
+                let idx = 0;
+                for (const link of links) {{
+                    const id = link.id || '';
+                    if (id.includes('skipper') || link.textContent.trim().toLowerCase() === 'next') continue;
+                    if (idx === {i}) {{
+                        link.click();
+                        return true;
+                    }}
+                    idx++;
+                }}
+                return false;
+            }}""")
 
-        logger.info("Found %d %s button(s)", len(buttons), platform)
-
-        for btn in buttons:
-            try:
-                # Click the button - may open new tab
-                new_page = await wait_for_new_page(
-                    page.context,
-                    btn.click(),
-                    timeout=10000,
-                )
-                if new_page:
-                    await random_delay(2000, 4000)
-                    try:
-                        await new_page.close()
-                    except Exception:
-                        pass
+            if clicked:
+                # Check if a new tab opened
+                try:
+                    new_page = await page.context.wait_for_event("page", timeout=5000)
+                    if new_page:
+                        await new_page.wait_for_load_state("domcontentloaded")
+                        logger.info("Opened %s link in new tab", platform)
+                        await random_delay(2000, 4000)
+                        try:
+                            await new_page.close()
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
                 await random_delay(500, 1500)
-            except Exception as e:
-                logger.warning("Failed to click %s button: %s", platform, e)
 
-        # Click Next/Continue after social links
-        await self._click_next_or_submit(page, required=False)
+        # Click Next/Skip button
+        next_clicked = await page.evaluate(f"""() => {{
+            const step = document.querySelector('.fangate-slider-content.{step_class}');
+            if (!step) return false;
+            // Try skipper/next buttons
+            const skipper = step.querySelector('button.button-next, button[id*="skipper"], a.button-next, a[id*="skipper"]');
+            if (skipper) {{ skipper.click(); return true; }}
+            // Fallback: any Next button in the step
+            const btns = step.querySelectorAll('button');
+            for (const btn of btns) {{
+                if (btn.textContent.trim().toLowerCase() === 'next') {{
+                    btn.click();
+                    return true;
+                }}
+            }}
+            return false;
+        }}""")
+
+        if next_clicked:
+            logger.info("Clicked Next for %s", platform)
+            await random_delay(1000, 2000)
+        else:
+            logger.warning("Next button not found for %s", platform)
 
     async def _handle_download(self, page: Page, config: Config) -> str | None:
         logger.info("Looking for download button")
         await random_delay(1000, 2000)
 
-        download_selectors = [
-            "a[href*='download']",
-            "button:has-text('Download')",
-            "a:has-text('Download')",
-            ".download-btn",
-            "[class*='download']",
-            "#downloadProcess a",
-            "a.hy-btn",
-        ]
+        # Try clicking download button and catching the download
+        dl_exists = await page.evaluate("""() => {
+            return !!document.querySelector('#gateDownloadButton, a.free_dwln');
+        }""")
 
-        for selector in download_selectors:
-            btn = await page.query_selector(selector)
-            if btn and await btn.is_visible():
-                href = await btn.get_attribute("href")
-                if href and not href.startswith("javascript:"):
-                    # Direct download link
-                    path = await wait_for_download(
-                        page,
-                        btn.click(),
-                        config.download.output_dir,
-                    )
-                    if path:
-                        return path
-                else:
-                    # Button click triggers download
-                    path = await wait_for_download(
-                        page,
-                        btn.click(),
-                        config.download.output_dir,
-                    )
-                    if path:
-                        return path
+        if dl_exists:
+            try:
+                async with page.expect_download(timeout=30000) as download_info:
+                    await page.evaluate("""() => {
+                        const btn = document.querySelector('#gateDownloadButton') ||
+                                    document.querySelector('a.free_dwln');
+                        if (btn) btn.click();
+                    }""")
+                download = await download_info.value
+                from pathlib import Path
+                save_path = str(Path(config.download.output_dir) / download.suggested_filename)
+                await download.save_as(save_path)
+                logger.info("Downloaded: %s", save_path)
+                return save_path
+            except Exception as e:
+                logger.error("Download failed: %s", e)
+                return None
 
-        logger.warning("No download button found")
+        logger.warning("Download button not found")
         return None
-
-    async def _wait_for_current_step(self, page: Page, timeout: int = 5000) -> None:
-        """Wait for the current step slide to be ready."""
-        try:
-            await page.wait_for_selector(
-                ".current-slide, .fangate-slider-content:not(.move-left):not(.upcomming-slide)",
-                state="visible",
-                timeout=timeout,
-            )
-        except Exception:
-            pass  # Continue even if we can't detect the exact step
-
-    async def _click_next_or_submit(self, page: Page, required: bool = True) -> bool:
-        """Click the next/submit/continue button in the current step."""
-        next_selectors = [
-            ".current-slide button[type='submit']",
-            ".current-slide .hy-btn",
-            "button:has-text('Next')",
-            "button:has-text('Continue')",
-            "button:has-text('Submit')",
-            "a:has-text('Next')",
-            "input[type='submit']",
-            ".fangate-slider-content:not(.move-left) .hy-btn",
-        ]
-
-        for selector in next_selectors:
-            if await safe_click(page, selector, timeout=3000):
-                await random_delay(1000, 2000)
-                return True
-
-        if required:
-            logger.warning("Next/Submit button not found")
-        return False
