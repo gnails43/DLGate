@@ -1,0 +1,21 @@
+[project]
+name = "dlgate"
+version = "0.1.0"
+description = "Automated download gate processor for music tracks (Hypeddit, etc.)"
+requires-python = ">=3.10"
+dependencies = [
+    "playwright>=1.40",
+    "click>=8.0",
+    "pyyaml>=6.0",
+    "rich>=13.0",
+]
+
+[project.scripts]
+dlgate = "dlgate.cli:main"
+
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.backends._legacy:_Backend"
+
+[tool.setuptools.packages.find]
+where = ["src"]

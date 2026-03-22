@@ -1,0 +1,31 @@
+{
+  "manifest_version": 3,
+  "name": "DLGate - Download List",
+  "version": "1.0.0",
+  "description": "Add SoundCloud and Hypeddit tracks to your download list",
+  "permissions": ["storage", "downloads"],
+  "action": {
+    "default_popup": "popup/popup.html",
+    "default_icon": {
+      "16": "icons/icon16.png",
+      "48": "icons/icon48.png",
+      "128": "icons/icon128.png"
+    }
+  },
+  "content_scripts": [
+    {
+      "matches": ["*://*.soundcloud.com/*", "*://*.hypeddit.com/*"],
+      "js": ["content/content.js"],
+      "css": ["content/content.css"],
+      "run_at": "document_idle"
+    }
+  ],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "icons": {
+    "16": "icons/icon16.png",
+    "48": "icons/icon48.png",
+    "128": "icons/icon128.png"
+  }
+}

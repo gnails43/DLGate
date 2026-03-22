@@ -1,0 +1,17 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(rm -f \"C:/GitHub/DLGate/.git/worktrees/vigilant-ramanujan/index.lock\")",
+      "Read(//c/GitHub/DLGate/.git/worktrees/vigilant-ramanujan/**)",
+      "Read(//c/GitHub/.git/worktrees/vigilant-ramanujan/**)",
+      "Read(//c/GitHub/**)",
+      "Bash(cmd.exe /c \"del C:\\\\GitHub\\\\.git\\\\worktrees\\\\vigilant-ramanujan\\\\index.lock\")",
+      "Bash(powershell -Command \"Remove-Item -Force ''C:\\\\GitHub\\\\.git\\\\worktrees\\\\vigilant-ramanujan\\\\index.lock''\")",
+      "Bash(powershell -Command \"Get-Process | Where-Object { $_.ProcessName -match ''git'' } | Select-Object Id, ProcessName\")",
+      "Bash(powershell -Command \"Get-ChildItem ''C:\\\\GitHub\\\\.git\\\\worktrees\\\\vigilant-ramanujan\\\\'' -Filter ''index*'' | Select-Object Name, Length, LastWriteTime\")",
+      "Bash(powershell -Command \"Test-Path ''C:\\\\GitHub\\\\.git\\\\worktrees\\\\vigilant-ramanujan\\\\index.lock''\")",
+      "Bash(GIT_DIR=\"C:/GitHub/DLGate/.git/worktrees/vigilant-ramanujan\" git -C \"C:\\\\GitHub\\\\DLGate\\\\.claude\\\\worktrees\\\\vigilant-ramanujan\" status)",
+      "Bash(powershell -Command \"& { $lockPath = ''C:\\\\GitHub\\\\.git\\\\worktrees\\\\vigilant-ramanujan\\\\index.lock''; Write-Host \\(''Exists: '' + \\(Test-Path $lockPath\\)\\); if \\(Test-Path $lockPath\\) { Get-Item $lockPath | Select-Object FullName, Length, LastWriteTime, Attributes; try { [System.IO.File]::Delete\\($lockPath\\); Write-Host ''Deleted'' } catch { Write-Host $_.Exception.Message } } }\")"
+    ]
+  }
+}
