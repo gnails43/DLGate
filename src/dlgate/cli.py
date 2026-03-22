@@ -111,6 +111,59 @@ async def _setup(config_path: str, services: tuple[str, ...]) -> None:
 
 
 @main.command()
+@click.pass_context
+def check(ctx: click.Context) -> None:
+    """Check login status for each SNS."""
+    asyncio.run(_check(ctx.obj["config_path"]))
+
+
+async def _check(config_path: str) -> None:
+    from dlgate.browser.session import BrowserSession
+
+    config = Config.load(config_path)
+    config.ensure_dirs()
+
+    checks = [
+        ("https://soundcloud.com/you/library", "SoundCloud",
+         "document.querySelector('a[href*=\"/you\"], .header__userNavUsernameButton, .userNav__username')?.textContent?.trim() || ''"),
+        ("https://open.spotify.com", "Spotify",
+         "document.querySelector('[data-testid=\"user-widget-link\"], button[data-testid=\"user-widget-link\"]')?.textContent?.trim() || ''"),
+        ("https://www.instagram.com", "Instagram",
+         "document.querySelector('img[data-testid=\"user-avatar\"], span._aacl._aacn')?.alt || document.querySelector('a[href*=\"/accounts/\"]') ? '' : (document.querySelector('svg[aria-label=\"Home\"]') ? 'logged in' : '')"),
+        ("https://www.tiktok.com", "TikTok",
+         "document.querySelector('[data-e2e=\"profile-icon\"], .avatar-anchor')?.href ? 'logged in' : ''"),
+        ("https://www.youtube.com", "YouTube",
+         "document.querySelector('#avatar-btn, button#avatar-btn')? 'logged in' : ''"),
+    ]
+
+    console.print("[bold]Checking login status...[/bold]")
+    console.print()
+
+    async with BrowserSession(config.browser) as session:
+        page = session.page
+
+        for url, name, js_check in checks:
+            try:
+                await page.goto(url, wait_until="domcontentloaded", timeout=15000)
+                await page.wait_for_timeout(3000)
+                result = await page.evaluate(js_check)
+                if result:
+                    console.print(f"  [bold green]OK[/bold green]  {name} ({result})")
+                else:
+                    # Check if redirected to login page
+                    current_url = page.url
+                    if "login" in current_url or "signin" in current_url or "accounts" in current_url:
+                        console.print(f"  [bold red]NG[/bold red]  {name} (not logged in)")
+                    else:
+                        console.print(f"  [yellow]??[/yellow]  {name} (could not determine)")
+            except Exception as e:
+                console.print(f"  [yellow]??[/yellow]  {name} (error: {e})")
+
+    console.print()
+    console.print("Run [bold]dlgate setup <service>[/bold] to log in to specific services.")
+
+
+@main.command()
 @click.argument("json_file", type=click.Path(exists=True))
 @click.pass_context
 def process(ctx: click.Context, json_file: str) -> None:

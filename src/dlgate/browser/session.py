@@ -80,10 +80,16 @@ class BrowserSession:
 
     async def close(self) -> None:
         if self._context:
-            await self._context.close()
+            try:
+                await self._context.close()
+            except Exception:
+                pass  # Browser may already be closed by user
             self._context = None
         if self._playwright:
-            await self._playwright.stop()
+            try:
+                await self._playwright.stop()
+            except Exception:
+                pass
             self._playwright = None
         logger.info("Browser session closed")
 
