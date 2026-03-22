@@ -11,6 +11,10 @@
   transition: background-color 0.2s, transform 0.1s;
   white-space: nowrap;
   z-index: 9999;
+  margin-left: 4px;
+  vertical-align: middle;
+  line-height: 26px;
+  height: 26px;
 }
 
 .dlgate-btn:hover {
@@ -32,10 +36,6 @@
   transform: none;
 }
 
-.dlgate-btn-feed {
-  margin-left: 4px;
-}
-
 .dlgate-btn-fixed {
   position: fixed;
   top: 12px;
@@ -44,4 +44,6 @@
   box-shadow: 0 2px 8px rgba(0, 0, 0, 0.3);
   padding: 10px 20px;
   font-size: 14px;
+  height: auto;
+  line-height: normal;
 }

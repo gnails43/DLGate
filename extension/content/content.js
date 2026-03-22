@@ -5,29 +5,12 @@
   const BUTTON_CLASS = "dlgate-add-btn";
   let currentUrl = location.href;
 
-  function isSoundCloudTrackPage() {
-    const path = location.pathname.replace(/\/$/, "");
-    const segments = path.split("/").filter(Boolean);
-    if (segments.length !== 2) return false;
-    const reserved = [
-      "discover", "stream", "you", "search", "upload",
-      "settings", "messages", "notifications", "charts", "stations",
-    ];
-    if (reserved.includes(segments[0])) return false;
-    const reservedSecond = [
-      "sets", "likes", "reposts", "followers", "following",
-      "tracks", "albums", "playlists", "popular-tracks", "comments",
-    ];
-    if (reservedSecond.includes(segments[1])) return false;
-    return true;
-  }
-
   function isHypedditPage() {
     return location.hostname.includes("hypeddit.com");
   }
 
   function getTrackInfoFromPage() {
-    if (isSoundCloudTrackPage()) {
+    if (location.hostname.includes("soundcloud.com")) {
       const titleEl = document.querySelector(
         ".soundTitle__title span, .listenDetails__trackTitle span"
       );
@@ -58,41 +41,71 @@
     return null;
   }
 
-  function getTrackInfoFromFeedItem(item) {
-    // Extract track URL from the feed item's title link
-    const titleLink = item.querySelector(
-      "a.soundTitle__title, a.sc-link-primary[href*='/']"
-    );
-    const artistLink = item.querySelector(
-      "a.soundTitle__username, a.sc-link-light[href*='/']"
-    );
-
-    if (!titleLink) return null;
-
-    const href = titleLink.href;
-    if (!href) return null;
-
-    // Validate it looks like a track URL (artist/track pattern)
-    try {
-      const url = new URL(href);
-      const segments = url.pathname.replace(/\/$/, "").split("/").filter(Boolean);
-      if (segments.length !== 2) return null;
-    } catch {
-      return null;
+  function extractTrackUrlFromContext(element) {
+    // Walk up from the button area to find the containing sound item,
+    // then find the track title link within it
+    let container = element;
+    for (let i = 0; i < 15; i++) {
+      if (!container.parentElement) break;
+      container = container.parentElement;
+      // Look for a title link in this container
+      const titleLink = container.querySelector(
+        'a[href*="/"]:not([href*="/tags/"]):not([href*="/discover"])'
+      );
+      if (titleLink) {
+        const href = titleLink.href;
+        try {
+          const url = new URL(href);
+          const segments = url.pathname
+            .replace(/\/$/, "")
+            .split("/")
+            .filter(Boolean);
+          // Must be artist/track format (2 segments)
+          if (segments.length === 2 && !isReservedPath(segments)) {
+            // Try to get title and artist text
+            const titleText = titleLink.textContent.trim();
+            // Look for artist link nearby
+            let artistText = "";
+            const artistLink = container.querySelector(
+              'a.soundTitle__username, a[href="/' + segments[0] + '"]'
+            );
+            if (artistLink && artistLink !== titleLink) {
+              artistText = artistLink.textContent.trim();
+            }
+            return {
+              url: href.split("?")[0],
+              title: titleText || "",
+              artist: artistText || segments[0],
+              type: "soundcloud",
+            };
+          }
+        } catch {
+          continue;
+        }
+      }
     }
+    return null;
+  }
 
-    return {
-      url: href.split("?")[0],
-      title: titleLink.textContent.trim() || "",
-      artist: artistLink ? artistLink.textContent.trim() : "",
-      type: "soundcloud",
-    };
+  function isReservedPath(segments) {
+    const reserved = [
+      "discover", "stream", "you", "search", "upload", "feed",
+      "settings", "messages", "notifications", "charts", "stations",
+    ];
+    if (reserved.includes(segments[0])) return true;
+    const reservedSecond = [
+      "sets", "likes", "reposts", "followers", "following",
+      "tracks", "albums", "playlists", "popular-tracks", "comments",
+    ];
+    if (reservedSecond.includes(segments[1])) return true;
+    return false;
   }
 
   function createButton(trackInfo) {
     const btn = document.createElement("button");
-    btn.className = `${BUTTON_CLASS} dlgate-btn`;
+    btn.className = `${BUTTON_CLASS} dlgate-btn sc-button sc-button-small`;
     btn.textContent = "+ DL List";
+    btn.title = "Add to DLGate download list";
     btn.dataset.dlgateUrl = trackInfo.url;
     btn.addEventListener("click", (e) => {
       e.preventDefault();
@@ -126,98 +139,63 @@
   }
 
   async function checkIfAdded(btn, url) {
-    const response = await chrome.runtime.sendMessage({
-      type: "CHECK_URL",
-      url,
-    });
-
-    if (response.exists) {
-      btn.textContent = "Added";
-      btn.classList.add("dlgate-btn-added");
+    try {
+      const response = await chrome.runtime.sendMessage({
+        type: "CHECK_URL",
+        url,
+      });
+      if (response.exists) {
+        btn.textContent = "Added";
+        btn.classList.add("dlgate-btn-added");
+      }
+    } catch {
+      // Extension context may be invalidated
     }
   }
 
-  // --- Track page injection (after cart icon) ---
-  function injectTrackPageButton() {
-    if (!isSoundCloudTrackPage() && !isHypedditPage()) return;
+  function injectButtons() {
+    if (isHypedditPage()) {
+      injectHypedditButton();
+      return;
+    }
 
-    // Already injected on this page?
-    const existing = document.querySelector(
-      ".soundActions .dlgate-add-btn, .dlgate-btn-fixed"
+    if (!location.hostname.includes("soundcloud.com")) return;
+
+    // Strategy: Find all button groups that contain SC action buttons,
+    // and insert our button after the last button in each group.
+    // SC button groups use .sc-button-group containers.
+    const buttonGroups = document.querySelectorAll(
+      ".sc-button-group, .soundActions .sc-button-toolbar"
     );
-    if (existing) return;
+
+    for (const group of buttonGroups) {
+      // Skip if already has our button
+      if (group.querySelector(`.${BUTTON_CLASS}`)) continue;
+
+      // Must contain at least a few SC buttons to be an action bar
+      const scButtons = group.querySelectorAll(".sc-button");
+      if (scButtons.length < 3) continue;
+
+      // Get track info from surrounding context
+      const trackInfo = extractTrackUrlFromContext(group);
+      if (!trackInfo) continue;
+
+      const btn = createButton(trackInfo);
+      group.appendChild(btn);
+      checkIfAdded(btn, trackInfo.url);
+    }
+  }
+
+  function injectHypedditButton() {
+    if (document.querySelector(`.${BUTTON_CLASS}`)) return;
 
     const trackInfo = getTrackInfoFromPage();
     if (!trackInfo) return;
 
     const btn = createButton(trackInfo);
-
-    if (isSoundCloudTrackPage()) {
-      // Find the action bar and insert after the last button (cart icon is typically last)
-      const actionBar = document.querySelector(
-        ".soundActions .sc-button-toolbar"
-      );
-      if (actionBar) {
-        // Insert at the end of the toolbar (after cart icon)
-        actionBar.appendChild(btn);
-      } else {
-        // Fallback: try the soundActions container
-        const actions = document.querySelector(".soundActions");
-        if (actions) {
-          actions.appendChild(btn);
-        } else {
-          btn.classList.add("dlgate-btn-fixed");
-          document.body.appendChild(btn);
-        }
-      }
-    } else if (isHypedditPage()) {
-      btn.classList.add("dlgate-btn-fixed");
-      document.body.appendChild(btn);
-    }
-
+    btn.classList.add("dlgate-btn-fixed");
+    document.body.appendChild(btn);
     checkIfAdded(btn, trackInfo.url);
-  }
-
-  // --- Feed injection ---
-  function injectFeedButtons() {
-    // Find all sound items in the feed that don't already have our button
-    const soundItems = document.querySelectorAll(
-      ".soundList__item, .stream__list li, .userStream__list li, .searchList__item"
-    );
-
-    for (const item of soundItems) {
-      if (item.querySelector(`.${BUTTON_CLASS}`)) continue;
-
-      const trackInfo = getTrackInfoFromFeedItem(item);
-      if (!trackInfo) continue;
-
-      const btn = createButton(trackInfo);
-      btn.classList.add("dlgate-btn-feed");
-
-      // Find the action buttons row within this item
-      const toolbar = item.querySelector(".sc-button-toolbar");
-      if (toolbar) {
-        toolbar.appendChild(btn);
-      } else {
-        // Fallback: find any action/engagement area
-        const actions = item.querySelector(
-          ".soundActions, .sound__soundActions"
-        );
-        if (actions) {
-          actions.appendChild(btn);
-        }
-      }
-
-      checkIfAdded(btn, trackInfo.url);
-    }
-  }
-
-  // --- Main injection logic ---
-  function injectAll() {
-    injectTrackPageButton();
-    if (location.hostname.includes("soundcloud.com")) {
-      injectFeedButtons();
-    }
   }
 
   // SoundCloud is an SPA - watch for URL changes
@@ -225,25 +203,25 @@
     setInterval(() => {
       if (location.href !== currentUrl) {
         currentUrl = location.href;
-        setTimeout(injectAll, 1000);
+        setTimeout(injectButtons, 1500);
       }
     }, 500);
   }
 
-  // Also use MutationObserver for SoundCloud SPA transitions & lazy-loaded feed items
+  // MutationObserver for SPA transitions & lazy-loaded feed items
   function watchDomChanges() {
     let debounceTimer = null;
     const observer = new MutationObserver(() => {
       if (debounceTimer) clearTimeout(debounceTimer);
       debounceTimer = setTimeout(() => {
-        injectAll();
-      }, 500);
+        injectButtons();
+      }, 800);
     });
     observer.observe(document.body, { childList: true, subtree: true });
   }
 
   // Initial injection
-  setTimeout(injectAll, 1000);
+  setTimeout(injectButtons, 1500);
   watchUrlChanges();
   watchDomChanges();
 })();
