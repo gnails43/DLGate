@@ -40,42 +40,59 @@ def main(ctx: click.Context, config_path: str, verbose: bool) -> None:
     ctx.obj["verbose"] = verbose
 
 
+ALL_SNS = {
+    "soundcloud": ("https://soundcloud.com", "SoundCloud"),
+    "spotify": ("https://open.spotify.com", "Spotify"),
+    "instagram": ("https://www.instagram.com", "Instagram"),
+    "tiktok": ("https://www.tiktok.com", "TikTok"),
+    "youtube": ("https://www.youtube.com", "YouTube"),
+}
+
+
 @main.command()
+@click.argument("services", nargs=-1)
 @click.pass_context
-def setup(ctx: click.Context) -> None:
-    """Open browser for initial SNS login setup."""
-    asyncio.run(_setup(ctx.obj["config_path"]))
+def setup(ctx: click.Context, services: tuple[str, ...]) -> None:
+    """Open browser for initial SNS login setup.
+
+    Optionally specify which services to open (e.g. dlgate setup spotify tiktok).
+    If none specified, opens all.
+    """
+    asyncio.run(_setup(ctx.obj["config_path"], services))
 
 
-async def _setup(config_path: str) -> None:
+async def _setup(config_path: str, services: tuple[str, ...]) -> None:
     from dlgate.browser.session import BrowserSession
 
     config = Config.load(config_path)
     config.ensure_dirs()
 
+    # Filter to requested services
+    if services:
+        urls = []
+        for s in services:
+            key = s.lower()
+            if key in ALL_SNS:
+                urls.append(ALL_SNS[key])
+            else:
+                console.print(f"[yellow]Unknown service: {s}[/yellow]")
+                console.print(f"Available: {', '.join(ALL_SNS.keys())}")
+                return
+    else:
+        urls = list(ALL_SNS.values())
+
     console.print("[bold]DLGate Setup[/bold]")
-    console.print("A browser will open. Please log in to each SNS:")
-    console.print("  - SoundCloud")
-    console.print("  - Spotify")
-    console.print("  - Instagram")
-    console.print("  - TikTok")
-    console.print("  - YouTube")
+    console.print("A browser will open. Please log in to:")
+    for _, name in urls:
+        console.print(f"  - {name}")
     console.print()
 
     async with BrowserSession(config.browser) as session:
         page = session.page
 
-        # Open each SNS in a new tab
-        urls = [
-            ("https://soundcloud.com", "SoundCloud"),
-            ("https://open.spotify.com", "Spotify"),
-            ("https://www.instagram.com", "Instagram"),
-            ("https://www.tiktok.com", "TikTok"),
-            ("https://www.youtube.com", "YouTube"),
-        ]
-
         try:
             await page.goto(urls[0][0])
+            console.print(f"  Opened {urls[0][1]}")
         except Exception:
             console.print(f"  [yellow]Warning: {urls[0][1]} failed to load, skipping[/yellow]")
         for url, name in urls[1:]:
