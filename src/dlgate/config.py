@@ -25,6 +25,7 @@ class BrowserConfig:
     headless: bool = False
     slow_mo: int = 100
     timeout: int = 30000
+    channel: str = ""
 
 
 @dataclass
@@ -71,6 +72,7 @@ class Config:
                 headless=br.get("headless", False),
                 slow_mo=br.get("slow_mo", 100),
                 timeout=br.get("timeout", 30000),
+                channel=br.get("channel", ""),
             )
 
         return config

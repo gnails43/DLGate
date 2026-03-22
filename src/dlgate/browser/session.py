@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import glob
 import logging
+import os
 from pathlib import Path
 from typing import Optional
 
@@ -30,17 +32,38 @@ class BrowserSession:
     async def __aexit__(self, *exc) -> None:
         await self.close()
 
+    @staticmethod
+    def _clean_lock_files(profile_dir: str) -> None:
+        """Remove stale browser lock files that prevent startup."""
+        lock_patterns = ["SingletonLock", "SingletonSocket", "SingletonCookie"]
+        for pattern in lock_patterns:
+            for lock_file in glob.glob(os.path.join(profile_dir, pattern)):
+                try:
+                    os.remove(lock_file)
+                    logger.debug("Removed stale lock file: %s", lock_file)
+                except OSError:
+                    pass
+
     async def start(self) -> None:
         profile_dir = str(Path(self._config.profile_dir).resolve())
         Path(profile_dir).mkdir(parents=True, exist_ok=True)
+        self._clean_lock_files(profile_dir)
 
         self._playwright = await async_playwright().start()
+
+        # Use local Chrome if channel is set, otherwise use Playwright's Chromium
+        launch_kwargs = {
+            "user_data_dir": profile_dir,
+            "headless": self._config.headless,
+            "slow_mo": self._config.slow_mo,
+            "viewport": {"width": 1280, "height": 900},
+            "accept_downloads": True,
+        }
+        if self._config.channel:
+            launch_kwargs["channel"] = self._config.channel
+
         self._context = await self._playwright.chromium.launch_persistent_context(
-            user_data_dir=profile_dir,
-            headless=self._config.headless,
-            slow_mo=self._config.slow_mo,
-            viewport={"width": 1280, "height": 900},
-            accept_downloads=True,
+            **launch_kwargs,
         )
         # Use existing page or create one
         if self._context.pages:

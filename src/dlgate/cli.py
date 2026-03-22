@@ -74,11 +74,17 @@ async def _setup(config_path: str) -> None:
             ("https://www.youtube.com", "YouTube"),
         ]
 
-        await page.goto(urls[0][0])
+        try:
+            await page.goto(urls[0][0])
+        except Exception:
+            console.print(f"  [yellow]Warning: {urls[0][1]} failed to load, skipping[/yellow]")
         for url, name in urls[1:]:
             new_page = await session.context.new_page()
-            await new_page.goto(url)
-            console.print(f"  Opened {name}")
+            try:
+                await new_page.goto(url)
+                console.print(f"  Opened {name}")
+            except Exception:
+                console.print(f"  [yellow]Warning: {name} failed to load, skipping[/yellow]")
 
         console.print()
         console.print("[bold green]Log in to each service, then press Enter to save sessions.[/bold green]")
