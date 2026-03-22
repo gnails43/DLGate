@@ -108,9 +108,8 @@ async def _check_buy_button(page: Page) -> Optional[str]:
 
 
 async def _get_description_text(page: Page) -> str:
-    """Extract the track description text and HTML via JavaScript."""
+    """Extract the track description text and link hrefs via JavaScript."""
     result = await page.evaluate("""() => {
-        // Try to get description text + HTML
         const selectors = [
             '.truncatedAudioInfo__content',
             '[class*="Description"]',
@@ -120,11 +119,14 @@ async def _get_description_text(page: Page) -> str:
         for (const sel of selectors) {
             const el = document.querySelector(sel);
             if (el) {
+                // Get plain text
                 const text = el.innerText || '';
-                const html = el.innerHTML || '';
-                if (text.trim() || html.trim()) {
-                    return text + ' ' + html;
-                }
+                // Also extract href values from any anchor tags
+                const hrefs = Array.from(el.querySelectorAll('a[href]'))
+                    .map(a => a.href)
+                    .join(' ');
+                const combined = (text + ' ' + hrefs).trim();
+                if (combined) return combined;
             }
         }
         return '';
