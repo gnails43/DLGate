@@ -124,6 +124,37 @@ async def process_single_track(session: BrowserSession, track: Track, config: Co
 
     # Find the right handler
     handler = get_handler(track.gate_url)
+
+    # If no handler found, the URL might redirect to a known gate platform.
+    # Follow the URL and check the final destination.
+    if not handler and track.gate_url:
+        logger.info("Unknown gate URL, following redirect: %s", track.gate_url)
+        try:
+            response = await page.goto(track.gate_url, wait_until="domcontentloaded", timeout=15000)
+            await page.wait_for_timeout(3000)
+            final_url = page.url
+
+            if final_url != track.gate_url:
+                logger.info("Redirected to: %s", final_url)
+                track.gate_url = final_url
+                handler = get_handler(final_url)
+
+            # If still no handler, check if the page itself is an aggregator
+            if not handler:
+                if is_aggregator_url(final_url):
+                    resolved = await resolve_aggregator(page, final_url)
+                    if resolved:
+                        track.gate_url = resolved
+                        handler = get_handler(resolved)
+                elif is_unsupported_platform(final_url):
+                    return GateResult(
+                        track=track,
+                        status=ProcessStatus.SKIPPED,
+                        error_message=f"Unsupported platform: {final_url}",
+                    )
+        except Exception as e:
+            logger.warning("Failed to follow gate URL: %s", e)
+
     if not handler:
         return GateResult(
             track=track,

@@ -32,22 +32,23 @@ async def detect_gate_url(page: Page, track_url: str) -> Optional[str]:
     await page.goto(track_url, wait_until="domcontentloaded")
     await page.wait_for_timeout(3000)  # Wait for SPA to render
 
-    # 1. Check the track description for gate URLs
+    # 1. Check the buy/cart button (most reliable on SoundCloud)
+    gate_url = await _check_buy_button(page)
+    if gate_url:
+        logger.info("Found gate URL in buy button: %s", gate_url)
+        return gate_url
+
+    # 2. Check the track description for gate URLs
     description = await _get_description_text(page)
     if description:
+        logger.debug("Description text: %s", description[:200])
         gate_url = _find_gate_url_in_text(description)
         if gate_url:
             logger.info("Found gate URL in description: %s", gate_url)
             return gate_url
 
-    # 2. Check for "Free Download" or "Buy" links
-    gate_url = await _check_download_links(page)
-    if gate_url:
-        logger.info("Found gate URL in download link: %s", gate_url)
-        return gate_url
-
-    # 3. Check all links on the page
-    gate_url = await _check_all_links(page)
+    # 3. Collect all links on the page via JS and check
+    gate_url = await _check_all_links_js(page)
     if gate_url:
         logger.info("Found gate URL in page links: %s", gate_url)
         return gate_url
@@ -56,56 +57,96 @@ async def detect_gate_url(page: Page, track_url: str) -> Optional[str]:
     return None
 
 
-async def _get_description_text(page: Page) -> str:
-    """Extract the track description text."""
-    selectors = [
-        ".truncatedAudioInfo__content",
-        ".soundActions .sc-text",
-        "[class*='description']",
-        ".sc-truncate",
-    ]
-    for sel in selectors:
-        el = await page.query_selector(sel)
-        if el:
-            text = await el.inner_text()
-            if text.strip():
-                return text
+async def _check_buy_button(page: Page) -> Optional[str]:
+    """Check the SoundCloud buy/cart button for a gate URL."""
+    # The cart/buy button on SoundCloud links to external sites
+    # Try multiple selectors for the buy link
+    href = await page.evaluate("""() => {
+        // Buy button selectors (cart icon)
+        const selectors = [
+            'a.sc-buylink',
+            'a[class*="buyButton"]',
+            'a[class*="BuyButton"]',
+            'a.sc-button-buy',
+            'a[title*="Buy"]',
+            'a[title*="buy"]',
+            'a[aria-label*="Buy"]',
+        ];
+        for (const sel of selectors) {
+            const el = document.querySelector(sel);
+            if (el && el.href) return el.href;
+        }
 
-    # Also get the raw HTML to find href attributes
-    for sel in selectors:
-        el = await page.query_selector(sel)
-        if el:
-            html = await el.inner_html()
-            if html.strip():
-                return html
+        // Also check for link in the "more" actions or any cart-like button
+        const allLinks = document.querySelectorAll('a[href]');
+        for (const link of allLinks) {
+            const classes = link.className || '';
+            const text = link.textContent.trim().toLowerCase();
+            if (
+                classes.includes('buy') ||
+                classes.includes('Buy') ||
+                text === 'buy' ||
+                text === 'free download' ||
+                text.includes('free download')
+            ) {
+                return link.href;
+            }
+        }
+        return null;
+    }""")
 
-    return ""
+    if href and _is_gate_url(href):
+        return href
 
+    # Even if not a known gate URL, if it's an external link from the buy button
+    # it might redirect to a gate. Return it for further processing.
+    if href and not href.startswith("https://soundcloud.com"):
+        logger.info("Buy button links to external URL: %s", href)
+        return href
 
-async def _check_download_links(page: Page) -> Optional[str]:
-    """Check buy/download buttons for gate URLs."""
-    selectors = [
-        "a[class*='buyButton']",
-        "a[class*='download']",
-        "a:has-text('Free Download')",
-        "a:has-text('Download')",
-        "a:has-text('Buy')",
-    ]
-    for sel in selectors:
-        elements = await page.query_selector_all(sel)
-        for el in elements:
-            href = await el.get_attribute("href")
-            if href and _is_gate_url(href):
-                return href
     return None
 
 
-async def _check_all_links(page: Page) -> Optional[str]:
-    """Scan all links on the page for gate URLs."""
-    links = await page.query_selector_all("a[href]")
-    for link in links:
-        href = await link.get_attribute("href")
-        if href and _is_gate_url(href):
+async def _get_description_text(page: Page) -> str:
+    """Extract the track description text and HTML via JavaScript."""
+    result = await page.evaluate("""() => {
+        // Try to get description text + HTML
+        const selectors = [
+            '.truncatedAudioInfo__content',
+            '[class*="Description"]',
+            '[class*="description"]',
+            '.sc-text',
+        ];
+        for (const sel of selectors) {
+            const el = document.querySelector(sel);
+            if (el) {
+                const text = el.innerText || '';
+                const html = el.innerHTML || '';
+                if (text.trim() || html.trim()) {
+                    return text + ' ' + html;
+                }
+            }
+        }
+        return '';
+    }""")
+    return result
+
+
+async def _check_all_links_js(page: Page) -> Optional[str]:
+    """Scan all links on the page for gate URLs using JavaScript."""
+    links = await page.evaluate("""() => {
+        const anchors = document.querySelectorAll('a[href]');
+        const hrefs = [];
+        for (const a of anchors) {
+            if (a.href && !a.href.startsWith('https://soundcloud.com')) {
+                hrefs.push(a.href);
+            }
+        }
+        return hrefs;
+    }""")
+
+    for href in links:
+        if _is_gate_url(href):
             return href
     return None
 
