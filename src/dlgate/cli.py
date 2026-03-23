@@ -16,7 +16,18 @@ from rich.table import Table
 from dlgate.config import Config
 from dlgate.models import ProcessStatus
 
-console = Console()
+# Force UTF-8 output on Windows to avoid cp932 encoding errors
+import sys
+if sys.platform == "win32":
+    import os
+    os.environ.setdefault("PYTHONIOENCODING", "utf-8")
+    try:
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+        sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+
+console = Console(force_terminal=True)
 
 
 def setup_logging(verbose: bool) -> None:

@@ -88,6 +88,7 @@ class HypedditHandler(BaseGateHandler):
         self._gate_id: str | None = None
         self._steps: str | None = None
         self._csrf_token: str | None = None
+        self._is_skippable: bool = True
 
     async def can_handle(self, url: str) -> bool:
         return "hypeddit.com" in url
@@ -105,8 +106,27 @@ class HypedditHandler(BaseGateHandler):
             page.on("request", self._capture_request)
             page.on("response", self._capture_response)
 
-            await page.goto(gate_url, wait_until="domcontentloaded")
+            response = await page.goto(gate_url, wait_until="domcontentloaded")
             await random_delay(2000, 3000)
+
+            # Check for 404 / deleted gate
+            if response and response.status == 404:
+                logger.warning("Gate returned 404: %s", gate_url)
+                result.status = ProcessStatus.SKIPPED
+                result.error_message = "Gate page not found (404)"
+                return result
+
+            # Check page content for deleted/removed gate
+            page_text = await page.evaluate("document.body?.innerText?.substring(0, 500) || ''")
+            if any(phrase in page_text.lower() for phrase in [
+                "page not found", "gate not found", "has been removed",
+                "no longer available", "this page doesn't exist",
+                "404", "not found",
+            ]):
+                logger.warning("Gate appears deleted: %s", gate_url)
+                result.status = ProcessStatus.SKIPPED
+                result.error_message = "Gate page deleted or not found"
+                return result
 
             # Dismiss cookie consent if present
             await self._dismiss_cookies(page)
@@ -179,6 +199,9 @@ class HypedditHandler(BaseGateHandler):
                     await random_delay(1000, 2000)
 
                 elif screen == "download_ready":
+                    # Before attempting download, ensure all steps are marked
+                    # as skip_gate_steps to maximize chances of server accepting
+                    await self._mark_all_steps_skipped(page)
                     download_path = await self._handle_final_download(page, config)
                     if download_path:
                         result.status = ProcessStatus.SUCCESS
@@ -253,6 +276,26 @@ class HypedditHandler(BaseGateHandler):
                             request.method, url, request.post_data, entry.get("headers", {}))
             self._api_requests.append(entry)
 
+    async def _capture_response_async(self, response) -> None:
+        """Capture responses from Hypeddit API endpoints (async version)."""
+        url = response.url
+        if "hypeddit.com" in url and ("setGate" in url or "download" in url or "gate" in url.split("hypeddit.com")[-1]):
+            entry = {
+                "url": url,
+                "status": response.status,
+                "type": "response",
+            }
+            # Capture response body for download API
+            if "download" in url:
+                try:
+                    body = await response.text()
+                    entry["body"] = body[:2000]
+                    logger.info("GATE API Response body: %s", body[:500])
+                except Exception:
+                    pass
+            self._api_requests.append(entry)
+            logger.info("GATE API Response: %d %s", response.status, url)
+
     def _capture_response(self, response) -> None:
         """Capture responses from Hypeddit API endpoints."""
         url = response.url
@@ -293,6 +336,36 @@ class HypedditHandler(BaseGateHandler):
                 }
             });
         }""")
+
+    async def _mark_all_steps_skipped(self, page: Page) -> None:
+        """Add skip_gate_steps hidden inputs for all step types.
+
+        This tells the download API that all intermediate steps can be skipped.
+        Some gates already have these inputs pre-set by the gate creator.
+        """
+        result = await page.evaluate("""() => {
+            const stepTypes = ['email', 'sc', 'ig', 'tk', 'sp', 'yt', 'fb', 'tw', 'am'];
+            const added = [];
+            for (const step of stepTypes) {
+                // Don't add if already exists
+                const existing = document.querySelector(`input[name="skip_gate_steps[]"][value="${step}"]`);
+                if (!existing) {
+                    const input = document.createElement('input');
+                    input.type = 'hidden';
+                    input.name = 'skip_gate_steps[]';
+                    input.value = step;
+                    input.id = 'skippable_' + step;
+                    const anchor = document.querySelector('#is_skippable') || document.querySelector('form') || document.body;
+                    anchor.appendChild(input);
+                    added.push(step);
+                }
+            }
+            // Also collect existing skip inputs
+            const existing = Array.from(document.querySelectorAll('input[name="skip_gate_steps[]"]'))
+                .map(el => el.value);
+            return { added, existing };
+        }""")
+        logger.info("Skip gate steps: added=%s existing=%s", result.get("added"), result.get("existing"))
 
     async def _extract_gate_metadata(self, page: Page) -> None:
         """Extract gate ID, step config, CSRF token, and jumpGate function info."""
@@ -362,7 +435,12 @@ class HypedditHandler(BaseGateHandler):
         self._steps = meta.get("steps_select")
         self._csrf_token = meta.get("csrf_meta") or meta.get("csrf_input") or meta.get("jquery_csrf")
 
-        logger.info("Gate metadata: id=%s steps=%s", self._gate_id, self._steps)
+        # Track skippable status
+        hidden = meta.get("all_hidden_inputs", {})
+        is_skip_val = hidden.get("is_skippable") or hidden.get("name:is_skippable") or "1"
+        self._is_skippable = is_skip_val != "0"
+
+        logger.info("Gate metadata: id=%s steps=%s skippable=%s", self._gate_id, self._steps, self._is_skippable)
         logger.info("  CSRF: meta=%s input=%s jquery=%s",
                      meta.get("csrf_meta"), meta.get("csrf_input"), meta.get("jquery_csrf"))
         logger.info("  jumpGate exists: %s, source: %s",
@@ -411,33 +489,103 @@ class HypedditHandler(BaseGateHandler):
     async def _handle_email(self, page: Page, config: Config) -> None:
         """Handle email input step."""
         logger.info("Filling email form")
-        if await js_fill(page, "#email_name", config.user.name):
-            logger.info("Filled name: %s", config.user.name)
-        if await js_fill(page, "#email_address", config.user.email):
-            logger.info("Filled email: %s", config.user.email)
+
+        # Use Playwright fill() for proper event triggering
+        try:
+            name_input = await page.query_selector('#email_name')
+            if name_input:
+                await name_input.fill(config.user.name)
+                logger.info("Filled name: %s", config.user.name)
+        except Exception:
+            await js_fill(page, "#email_name", config.user.name)
+            logger.info("Filled name (JS fallback): %s", config.user.name)
+
+        try:
+            email_input = await page.query_selector('#email_address')
+            if email_input:
+                await email_input.fill(config.user.email)
+                logger.info("Filled email: %s", config.user.email)
+        except Exception:
+            await js_fill(page, "#email_address", config.user.email)
+            logger.info("Filled email (JS fallback): %s", config.user.email)
+
+        await random_delay(500, 1000)
+
+        # Also register email via API directly (ensures server-side registration)
+        if self._gate_id and self._csrf_token:
+            email_result = await page.evaluate(f"""async () => {{
+                try {{
+                    const fd = new URLSearchParams();
+                    fd.append('validateEmailAddress', {repr(config.user.email)});
+                    fd.append('fan_gate_id', '{self._gate_id}');
+                    fd.append('email_name', {repr(config.user.name)});
+                    fd.append('adcode', '');
+                    fd.append('hypesource', '');
+                    const r = await fetch('/verifyEmailAddress', {{
+                        method: 'POST', body: fd.toString(), credentials: 'include',
+                        headers: {{
+                            'Content-Type': 'application/x-www-form-urlencoded',
+                            'X-Requested-With': 'XMLHttpRequest',
+                            'X-CSRF-TOKEN': '{self._csrf_token}',
+                        }},
+                    }});
+                    return await r.text();
+                }} catch(e) {{
+                    return 'error: ' + e.message;
+                }}
+            }}""")
+            logger.info("Email API: %s", str(email_result)[:200])
+
+        # Use Playwright real click on submit button (not JS click)
+        try:
+            btn = await page.query_selector('#email_to_downloads_next')
+            if btn:
+                await btn.click(force=True)
+                logger.info("Clicked email submit (Playwright real click)")
+                await random_delay(2000, 3000)
+                return
+        except Exception as e:
+            logger.debug("Playwright email submit failed: %s", e)
+
+        # Fallback: try JS click
         if await js_click(page, "#email_to_downloads_next"):
-            logger.info("Clicked email submit")
-            await random_delay(2000, 4000)
+            logger.info("Clicked email submit (JS fallback)")
+            await random_delay(2000, 3000)
 
     async def _handle_soundcloud(self, page: Page, config: Config) -> None:
-        """Handle SoundCloud step (comment + Connect via OAuth)."""
+        """Handle SoundCloud step (comment + Connect via OAuth).
+
+        Flow:
+        1. Fill SC comment text
+        2. Save comment via /setSC API
+        3. Extract OAuth URL from button's data-onclick attribute
+        4. Open popup via window.open (preserves window.opener)
+        5. Click Allow on SC authorization page
+        6. Wait for popup to close (auth2.php callback calls self.close())
+        7. Call /windowopenerlog to register SC step completion
+        """
         logger.info("Handling SoundCloud step")
 
-        # Fill comment field if present
+        # Fill comment field
         comment = random.choice(config.comments)
         filled = await page.evaluate(f"""() => {{
-            const containers = [
-                document.querySelector('.current-slide'),
-                document.querySelector('.fangate-slider-content.sc'),
-            ];
-            for (const container of containers) {{
-                if (!container) continue;
-                const ta = container.querySelector('textarea, input[type="text"]:not([type="hidden"]):not([type="email"])');
-                if (ta) {{
-                    ta.value = {repr(comment)};
-                    ta.dispatchEvent(new Event('input', {{bubbles: true}}));
-                    ta.dispatchEvent(new Event('change', {{bubbles: true}}));
-                    return true;
+            // Fill the comment textarea/input
+            const selectors = ['#sc_comment_text', 'textarea', 'input[type="text"]:not([type="hidden"]):not([type="email"])'];
+            for (const sel of selectors) {{
+                const containers = [
+                    document.querySelector('.current-slide'),
+                    document.querySelector('.fangate-slider-content.sc'),
+                    document,
+                ];
+                for (const container of containers) {{
+                    if (!container) continue;
+                    const el = container.querySelector(sel);
+                    if (el) {{
+                        el.value = {repr(comment)};
+                        el.dispatchEvent(new Event('input', {{bubbles: true}}));
+                        el.dispatchEvent(new Event('change', {{bubbles: true}}));
+                        return true;
+                    }}
                 }}
             }}
             return false;
@@ -446,142 +594,146 @@ class HypedditHandler(BaseGateHandler):
             logger.info("Filled comment: %s", comment)
             await random_delay(500, 1000)
 
-        # Click Connect button with Playwright real click (MUST be real click to open popup)
-        clicked = False
+        # Save SC comment via API (like the mobile flow does)
+        if self._gate_id and self._csrf_token:
+            sc_result = await page.evaluate(f"""async () => {{
+                const fd = new URLSearchParams();
+                fd.append('fan_gate_id', '{self._gate_id}');
+                fd.append('comment_sc', {repr(comment)});
+                const r = await fetch('/setSC', {{
+                    method: 'POST', body: fd.toString(), credentials: 'include',
+                    headers: {{
+                        'Content-Type': 'application/x-www-form-urlencoded',
+                        'X-Requested-With': 'XMLHttpRequest',
+                        'X-CSRF-TOKEN': '{self._csrf_token}',
+                    }},
+                }});
+                return await r.text();
+            }}""")
+            logger.info("SC comment API: %s", sc_result)
 
-        # First, find the button's details via JS to know what we're looking for
-        btn_info = await page.evaluate("""() => {
-            const containers = [
-                document.querySelector('.fangate-slider-content.sc.current-slide'),
-                document.querySelector('.current-slide'),
-                document.querySelector('.fangate-slider-content.sc'),
-            ];
-            for (const container of containers) {
-                if (!container) continue;
-                const btns = container.querySelectorAll('a, button');
-                const results = [];
-                for (const btn of btns) {
-                    const id = btn.id || '';
-                    if (id.includes('skipper')) continue;
-                    const text = btn.textContent.trim().toLowerCase();
-                    if (text === 'next' || text === 'skip') continue;
-                    if (btn.className.includes('hype-btn') || text.includes('connect') || text.includes('soundcloud')) {
-                        results.push({
-                            tag: btn.tagName,
-                            id: id,
-                            classes: btn.className,
-                            text: btn.textContent.trim(),
-                            href: btn.getAttribute('href') || '',
-                            onclick: btn.getAttribute('onclick') || '',
-                        });
-                    }
-                }
-                if (results.length > 0) return results;
+        # Extract OAuth URL from button's data-onclick attribute
+        oauth_url = await page.evaluate("""() => {
+            const btns = document.querySelectorAll('#login_to_sc');
+            for (const btn of btns) {
+                const attr = btn.getAttribute('data-onclick') || btn.getAttribute('onclick') || '';
+                const match = attr.match(/PopupCenterDual\\('([^']+)'/);
+                if (match) return match[1];
             }
-            return [];
+            return null;
         }""")
-        logger.info("SC buttons found: %s", btn_info)
 
-        # Try multiple Playwright selector strategies
-        try:
-            selectors = [
-                # SC-specific connect buttons
-                '.current-slide a.login-to-soundcloud-common',
-                '.current-slide a.hype-btn-soundcloud',
-                '.current-slide a[id*="login_sp"]',
-                '.current-slide a[id*="login_sc"]',
-                '.current-slide #login_sp',
-                # Generic button selectors in current slide
-                '.current-slide a.hype-btn-green',
-                '.current-slide button.hype-btn-green',
-                '.current-slide a.hype-btn',
-                # Wider selectors
-                '.fangate-slider-content.sc a.hype-btn-green',
-                '.fangate-slider-content.sc a.hype-btn',
-                '.fangate-slider-content.sc button.hype-btn-green',
-            ]
-            for sel in selectors:
-                btn = await page.query_selector(sel)
-                if btn:
-                    text = await btn.inner_text()
-                    btn_id = await btn.get_attribute("id") or ""
-                    if "skipper" in btn_id or text.strip().lower() in ("next", "skip"):
-                        continue
-                    logger.info("SC button found with selector %s: text=%s id=%s", sel, text.strip(), btn_id)
-                    await btn.click(force=True)
-                    logger.info("SC Connect clicked (Playwright real click): %s", text.strip())
-                    clicked = True
-                    break
-        except Exception as e:
-            logger.warning("Playwright SC click failed: %s", e)
+        if oauth_url:
+            logger.info("SC OAuth URL extracted: %s", oauth_url[:100])
 
-        # Fallback: use Playwright's text-based locator (also real click)
-        if not clicked:
+            # Open popup via window.open (preserves window.opener for callback)
             try:
-                connect_btn = page.get_by_text("Connect", exact=False).first
-                if connect_btn:
-                    await connect_btn.click(force=True)
-                    logger.info("SC Connect clicked via text locator")
-                    clicked = True
-            except Exception as e:
-                logger.debug("Text locator failed: %s", e)
+                async with page.expect_popup(timeout=10000) as popup_info:
+                    await page.evaluate(
+                        f"window.open('{oauth_url}', 'sc_popup', 'width=800,height=500')"
+                    )
+                popup = await popup_info.value
+                logger.info("SC OAuth popup opened (window.opener preserved)")
 
-        # Last resort: JS click (WARNING: may not open popup)
-        if not clicked:
-            logger.warning("No Playwright match for SC button, using JS click (popup may not open)")
-            result = await page.evaluate("""() => {
-                const sc = document.querySelector('.fangate-slider-content.sc.current-slide') ||
-                           document.querySelector('.fangate-slider-content.sc') ||
-                           document.querySelector('.current-slide');
-                if (!sc) return null;
-                const btns = sc.querySelectorAll('a.hype-btn-green, button.hype-btn-green, a.hype-btn, button.hype-btn');
-                for (const btn of btns) {
-                    const id = btn.id || '';
-                    if (id.includes('skipper')) continue;
-                    const text = btn.textContent.trim().toLowerCase();
-                    if (text === 'next' || text === 'skip') continue;
-                    btn.click();
-                    return btn.textContent.trim();
-                }
-                return null;
-            }""")
-            if result:
-                clicked = True
-                logger.info("SC Connect clicked (JS fallback): %s", result)
+                await popup.wait_for_load_state("domcontentloaded")
+                await random_delay(2000, 3000)
 
-        if clicked:
-            # Wait for OAuth popup and auto-authorize
-            try:
-                new_page = await page.context.wait_for_event("page", timeout=10000)
-                if new_page:
-                    await new_page.wait_for_load_state("domcontentloaded")
-                    logger.info("OAuth popup opened: %s", new_page.url)
+                # Handle the OAuth popup
+                if "soundcloud.com" in popup.url:
+                    await self._handle_sc_oauth_popup(popup)
 
-                    # Auto-handle the SoundCloud OAuth popup
-                    if "soundcloud.com" in new_page.url:
-                        await self._handle_sc_oauth_popup(new_page)
-
-                    # Wait for popup to close (redirect completes)
-                    try:
-                        await new_page.wait_for_event("close", timeout=30000)
-                        logger.info("OAuth popup closed successfully")
-                    except Exception:
-                        logger.warning("OAuth popup didn't close, forcing close")
+                # Wait for popup to close (auth2.php callback calls self.close())
+                for _ in range(20):
+                    import asyncio as _aio
+                    await _aio.sleep(1)
+                    if popup.is_closed():
+                        logger.info("SC OAuth popup closed (auth callback complete)")
+                        break
+                else:
+                    if not popup.is_closed():
                         try:
-                            await new_page.close()
+                            await popup.close()
                         except Exception:
                             pass
-            except Exception:
-                logger.info("No OAuth popup (may already be authorized)")
 
-            # Wait for server to process the OAuth callback and slide transition
-            await random_delay(5000, 8000)
+            except Exception as e:
+                logger.warning("SC OAuth popup failed: %s", e)
 
-            # Check if slide auto-advanced after OAuth
+            # Register SC step via /windowopenerlog (what the callback's
+            # localStorage event handler normally does)
+            if self._gate_id:
+                await page.evaluate(f"""async () => {{
+                    const fd = new URLSearchParams();
+                    fd.append('elementID', 'login_to_sc');
+                    fd.append('fangate_id', '{self._gate_id}');
+                    await fetch('/windowopenerlog', {{
+                        method: 'POST', body: fd.toString(), credentials: 'include',
+                        headers: {{
+                            'Content-Type': 'application/x-www-form-urlencoded',
+                            'X-Requested-With': 'XMLHttpRequest',
+                            'X-CSRF-TOKEN': '{self._csrf_token}',
+                        }},
+                    }});
+                }}""")
+                logger.info("Called /windowopenerlog for SC step")
+
+            # Wait for server processing
+            await random_delay(3000, 5000)
+
+            # Check if slide auto-advanced
             new_state = await detect_screen_state(page)
             if new_state["screen"] != "soundcloud":
                 logger.info("SC step auto-advanced to: %s", new_state["screen"])
                 return
+        else:
+            # No OAuth URL found - try clicking the button directly
+            logger.info("No OAuth URL in button, trying direct click")
+            clicked = False
+
+            try:
+                selectors = [
+                    '.current-slide a.login-to-soundcloud-common',
+                    '.current-slide a.hype-btn-soundcloud',
+                    '.current-slide a.hype-btn-green',
+                    '.fangate-slider-content.sc a.hype-btn-green',
+                ]
+                for sel in selectors:
+                    btn = await page.query_selector(sel)
+                    if btn:
+                        btn_id = await btn.get_attribute("id") or ""
+                        text = await btn.inner_text()
+                        if "skipper" in btn_id or text.strip().lower() in ("next", "skip"):
+                            continue
+                        await btn.click(force=True)
+                        clicked = True
+                        logger.info("SC Connect clicked: %s", text.strip())
+                        break
+            except Exception as e:
+                logger.warning("SC button click failed: %s", e)
+
+            if clicked:
+                # Wait for OAuth popup
+                try:
+                    new_page = await page.context.wait_for_event("page", timeout=10000)
+                    if new_page:
+                        await new_page.wait_for_load_state("domcontentloaded")
+                        if "soundcloud.com" in new_page.url:
+                            await self._handle_sc_oauth_popup(new_page)
+                        try:
+                            await new_page.wait_for_event("close", timeout=30000)
+                        except Exception:
+                            try:
+                                await new_page.close()
+                            except Exception:
+                                pass
+                except Exception:
+                    logger.info("No OAuth popup (may already be authorized)")
+
+                await random_delay(5000, 8000)
+                new_state = await detect_screen_state(page)
+                if new_state["screen"] != "soundcloud":
+                    logger.info("SC step auto-advanced to: %s", new_state["screen"])
+                    return
 
         # If we're still on SC step, the OAuth might have failed or wasn't needed
         logger.info("Still on SC step after Connect click, will try to advance")
@@ -825,33 +977,52 @@ class HypedditHandler(BaseGateHandler):
         step_class = platform_to_class.get(platform, platform)
         logger.info("Handling social step: %s (class: %s)", platform, step_class)
 
-        # Click action buttons (follow/like links, not Next/Skip)
-        action_count = await page.evaluate(f"""() => {{
-            const container = document.querySelector('.fangate-slider-content.{step_class}.current-slide') ||
-                              document.querySelector('.current-slide') ||
-                              document.querySelector('.fangate-slider-content.{step_class}');
-            if (!container) return 0;
-            const links = container.querySelectorAll('a.hype-btn, button.hype-btn, a.hype-btn-social, a.hype-btn-green');
-            let clicked = 0;
-            for (const link of links) {{
-                const id = link.id || '';
-                const text = link.textContent.trim().toLowerCase();
-                if (id.includes('skipper') || text === 'next' || text === 'skip') continue;
-                link.click();
-                clicked++;
-            }}
-            return clicked;
-        }}""")
-        logger.info("Clicked %d action(s) for %s", action_count, platform)
+        # Find and click action buttons using Playwright real click (not JS click)
+        container_sel = f'.fangate-slider-content.{step_class}.current-slide, .current-slide'
+        action_btns = await page.query_selector_all(
+            f'{container_sel} a.hype-btn, {container_sel} button.hype-btn, '
+            f'{container_sel} a.hype-btn-social, {container_sel} a.hype-btn-green'
+        )
+        action_count = 0
+        for btn in action_btns:
+            try:
+                btn_id = await btn.get_attribute("id") or ""
+                text = (await btn.inner_text()).strip().lower()
+                if "skipper" in btn_id or text in ("next", "skip"):
+                    continue
+                await btn.click(force=True)
+                action_count += 1
+                logger.info("Clicked %s action button: %s (id=%s)", platform, text, btn_id)
+            except Exception as e:
+                logger.debug("Button click failed: %s", e)
 
-        # Handle new tabs
+        if action_count == 0:
+            # Fallback to JS click
+            action_count = await page.evaluate(f"""() => {{
+                const container = document.querySelector('.fangate-slider-content.{step_class}.current-slide') ||
+                                  document.querySelector('.current-slide');
+                if (!container) return 0;
+                const links = container.querySelectorAll('a.hype-btn, button.hype-btn, a.hype-btn-social, a.hype-btn-green');
+                let clicked = 0;
+                for (const link of links) {{
+                    const id = link.id || '';
+                    const text = link.textContent.trim().toLowerCase();
+                    if (id.includes('skipper') || text === 'next' || text === 'skip') continue;
+                    link.click();
+                    clicked++;
+                }}
+                return clicked;
+            }}""")
+            logger.info("Clicked %d action(s) via JS fallback", action_count)
+
+        # Handle new tabs that opened
         if action_count > 0:
             try:
                 new_page = await page.context.wait_for_event("page", timeout=5000)
                 if new_page:
                     await new_page.wait_for_load_state("domcontentloaded")
                     logger.info("Opened %s tab: %s", platform, new_page.url)
-                    await random_delay(2000, 4000)
+                    await random_delay(3000, 5000)
                     try:
                         await new_page.close()
                     except Exception:
@@ -859,26 +1030,26 @@ class HypedditHandler(BaseGateHandler):
             except Exception:
                 pass
 
-        await random_delay(500, 1500)
+        await random_delay(1000, 2000)
 
-        # Click Next/Skip button - this should trigger the server-side registration
-        await self._try_click_next(page, step_class)
+        # Click Next/Skip button using Playwright real click
+        await self._try_click_next_playwright(page, step_class)
 
         # Wait for server to process
-        await random_delay(2000, 3000)
+        await random_delay(3000, 5000)
 
         # Check if auto-advanced
         new_state = await detect_screen_state(page)
         if new_state["screen"] != platform:
             logger.info("Step auto-advanced to: %s", new_state["screen"])
 
-    async def _wait_for_auto_advance(self, page: Page, current_screen: str, max_checks: int = 5) -> bool:
+    async def _wait_for_auto_advance(self, page: Page, current_screen: str, max_checks: int = 3) -> bool:
         """Wait for the page's own JS to auto-advance the slide after a step action.
 
         Returns True if the slide auto-advanced (server-side), False if still stuck.
         """
         for i in range(max_checks):
-            await random_delay(2000, 3000)
+            await random_delay(1000, 2000)
             new_state = await detect_screen_state(page)
             if new_state["screen"] != current_screen:
                 logger.info("Auto-advanced: %s -> %s (after %d checks)",
@@ -888,14 +1059,12 @@ class HypedditHandler(BaseGateHandler):
         return False
 
     async def _advance_slide(self, page: Page) -> bool:
-        """Advance to the next slide using server-side API calls.
+        """Advance to the next slide using server-side API + CSS manipulation.
 
         Strategy:
-        1. Click skipper button (triggers AJAX to /setGatePathwayOr)
-        2. Wait for server response
-        3. If slide didn't change, try calling jumpGate() directly
-        4. If still stuck, call the API via fetch() with gate_id
-        5. NO CSS manipulation - if server won't advance, we log and continue
+        1. Register skip with /setGatePathwayOr API (server-side)
+        2. Try skipper button click (triggers server + client JS)
+        3. If slide didn't change, do CSS manipulation (server already notified)
         """
         current_class = await page.evaluate("""() => {
             const current = document.querySelector('.fangate-slider-content.current-slide');
@@ -911,9 +1080,44 @@ class HypedditHandler(BaseGateHandler):
 
         logger.info("Advancing from step: %s", current_class)
 
-        # Method 1: Click the skipper button (most reliable - triggers AJAX)
+        # Step 1: Register skip server-side via /setGatePathwayOr
+        api_ok = False
+        if self._gate_id:
+            csrf_token = self._csrf_token or ""
+            api_result = await page.evaluate(f"""async () => {{
+                try {{
+                    let token = '{csrf_token}';
+                    if (!token) {{
+                        const meta = document.querySelector('meta[name="csrf-token"]');
+                        if (meta) token = meta.getAttribute('content');
+                    }}
+
+                    const fd = new URLSearchParams();
+                    fd.append('fan_gate_id', '{self._gate_id}');
+                    fd.append('skipSteps[]', '{current_class}');
+                    fd.append('selectedStep', '{current_class}');
+
+                    const response = await fetch('/setGatePathwayOr', {{
+                        method: 'POST',
+                        body: fd.toString(),
+                        credentials: 'include',
+                        headers: {{
+                            'Content-Type': 'application/x-www-form-urlencoded',
+                            'X-Requested-With': 'XMLHttpRequest',
+                            'X-CSRF-TOKEN': token,
+                        }},
+                    }});
+                    const text = await response.text();
+                    return {{ status: response.status, body: text.substring(0, 200) }};
+                }} catch(e) {{
+                    return {{ status: 0, body: 'error: ' + e.message }};
+                }}
+            }}""")
+            logger.info("Skip API: status=%s body=%s", api_result.get("status"), api_result.get("body"))
+            api_ok = api_result.get("status") == 200
+
+        # Step 2: Try skipper button click (may trigger client-side JS transition)
         skip_result = await page.evaluate(f"""() => {{
-            // Try multiple skipper selectors
             const selectors = [
                 '#skipper_{current_class}_channel',
                 '.current-slide [id*="skipper"]',
@@ -931,14 +1135,12 @@ class HypedditHandler(BaseGateHandler):
 
         if skip_result:
             logger.info("Skipper click: %s", skip_result)
-            # Wait for AJAX response and slide transition
-            await random_delay(3000, 5000)
+            await random_delay(2000, 3000)
 
             if await self._check_slide_changed(page, current_class):
                 return True
-            logger.info("Skipper click didn't advance slide")
 
-        # Method 2: Call jumpGate directly
+        # Step 3: Try jumpGate
         jump_result = await page.evaluate(f"""() => {{
             const current = document.querySelector('.fangate-slider-content.current-slide');
             if (!current) return 'no current slide';
@@ -953,107 +1155,43 @@ class HypedditHandler(BaseGateHandler):
         logger.info("jumpGate result: %s", jump_result)
 
         if "called" in str(jump_result):
-            await random_delay(3000, 5000)
-            if await self._check_slide_changed(page, current_class):
-                return True
-            logger.info("jumpGate didn't advance slide either")
-
-        # Method 3: Try calling the Hypeddit API directly via fetch with CSRF token
-        if self._gate_id:
-            csrf_token = self._csrf_token or ""
-            api_result = await page.evaluate(f"""async () => {{
-                try {{
-                    // Get CSRF token from multiple sources
-                    let token = '{csrf_token}';
-                    if (!token) {{
-                        const meta = document.querySelector('meta[name="csrf-token"]');
-                        if (meta) token = meta.getAttribute('content');
-                    }}
-                    if (!token) {{
-                        const input = document.querySelector('input[name="_token"]');
-                        if (input) token = input.value;
-                    }}
-                    // Try from cookie
-                    if (!token) {{
-                        const match = document.cookie.match(/XSRF-TOKEN=([^;]+)/);
-                        if (match) token = decodeURIComponent(match[1]);
-                    }}
-
-                    const formData = new FormData();
-                    formData.append('fan_gate_id', '{self._gate_id}');
-                    formData.append('step', '{current_class}');
-                    formData.append('action', 'skip');
-                    if (token) formData.append('_token', token);
-
-                    const headers = {{}};
-                    if (token) {{
-                        headers['X-CSRF-TOKEN'] = token;
-                        headers['X-XSRF-TOKEN'] = token;
-                    }}
-                    headers['X-Requested-With'] = 'XMLHttpRequest';
-
-                    const response = await fetch('/setGatePathwayOr', {{
-                        method: 'POST',
-                        body: formData,
-                        credentials: 'include',
-                        headers: headers,
-                    }});
-                    const text = await response.text();
-                    return 'fetch: ' + response.status + ' token=' + (token ? token.substring(0, 20) + '...' : 'NONE') + ' body=' + text.substring(0, 200);
-                }} catch(e) {{
-                    return 'fetch error: ' + e.message;
-                }}
-            }}""")
-            logger.info("Direct API call: %s", api_result)
-            await random_delay(2000, 3000)
-
-            if await self._check_slide_changed(page, current_class):
-                return True
-
-        # Method 4: Try using Hypeddit's slide transition function
-        transition_result = await page.evaluate(f"""() => {{
-            if (typeof rX5mPQjW7s === 'function') {{
-                try {{
-                    // This function takes an element ID to transition to
-                    const upcoming = document.querySelector('.fangate-slider-content.upcomming-slide');
-                    if (upcoming) {{
-                        // Get the data-group number
-                        const group = upcoming.getAttribute('data-group');
-                        if (group) {{
-                            rX5mPQjW7s(group);
-                            return 'transition called with group ' + group;
-                        }}
-                    }}
-                    return 'no upcoming slide or group';
-                }} catch(e) {{
-                    return 'transition error: ' + e.message;
-                }}
-            }}
-            return 'transition function not found';
-        }}""")
-        logger.info("Transition function: %s", transition_result)
-
-        if "called" in str(transition_result):
             await random_delay(2000, 3000)
             if await self._check_slide_changed(page, current_class):
                 return True
 
-        # Method 5 (last resort): CSS manipulation to at least visually advance
-        # This WON'T register server-side, but lets us see what's next
-        logger.warning("All server-side methods failed, falling back to CSS (download may not work)")
+        # Step 4: CSS manipulation to advance visually
+        # Server was already notified via API in step 1, so this is safe
+        if api_ok:
+            logger.info("API registered skip, doing CSS advance")
+        else:
+            logger.warning("API skip failed, CSS advance may cause download to fail")
+
         css_result = await page.evaluate("""() => {
             const current = document.querySelector('.fangate-slider-content.current-slide');
             const upcoming = document.querySelector('.fangate-slider-content.upcomming-slide');
-            if (!current || !upcoming) return 'no slides to advance';
+            if (!current || !upcoming) {
+                // Try finding next sibling slide
+                if (current) {
+                    const next = current.nextElementSibling;
+                    if (next && next.classList.contains('fangate-slider-content')) {
+                        current.classList.remove('current-slide', 'zindex');
+                        current.classList.add('move-left');
+                        next.classList.remove('upcomming-slide');
+                        next.classList.add('current-slide', 'zindex');
+                        return 'CSS advanced via sibling';
+                    }
+                }
+                return 'no slides to advance';
+            }
             current.classList.remove('current-slide', 'zindex');
             current.classList.add('move-left');
             upcoming.classList.remove('upcomming-slide');
             upcoming.classList.add('current-slide', 'zindex');
-            return 'CSS advanced (server NOT notified)';
+            return 'CSS advanced';
         }""")
-        logger.warning("CSS fallback: %s", css_result)
+        logger.info("CSS advance: %s", css_result)
         await random_delay(500, 1000)
-        return css_result.startswith('CSS advanced')
+        return 'CSS advanced' in str(css_result)
 
     async def _check_slide_changed(self, page: Page, previous_class: str) -> bool:
         """Check if the current slide has changed from the previous one."""
@@ -1069,6 +1207,40 @@ class HypedditHandler(BaseGateHandler):
             logger.info("Slide advanced: %s -> %s", previous_class, new_class)
             return True
         return False
+
+    async def _try_click_next_playwright(self, page: Page, step_class: str = "") -> bool:
+        """Try to click Next/Skip button using Playwright real click."""
+        # Try skipper button first
+        skipper_selectors = [
+            f'#skipper_{step_class}_channel',
+            '.current-slide [id*="skipper"]',
+            f'.fangate-slider-content.{step_class} [id*="skipper"]',
+        ]
+        for sel in skipper_selectors:
+            try:
+                btn = await page.query_selector(sel)
+                if btn:
+                    await btn.click(force=True)
+                    text = await btn.inner_text()
+                    logger.info("Clicked skipper (Playwright): %s text=%s", sel, text.strip())
+                    return True
+            except Exception:
+                continue
+
+        # Try Next/Skip text buttons
+        btns = await page.query_selector_all('.current-slide button, .current-slide a.hype-btn')
+        for btn in btns:
+            try:
+                text = (await btn.inner_text()).strip().lower()
+                if text in ("next", "skip"):
+                    await btn.click(force=True)
+                    logger.info("Clicked Next/Skip (Playwright): %s", text)
+                    return True
+            except Exception:
+                continue
+
+        # Fallback to JS
+        return await self._try_click_next(page, step_class)
 
     async def _try_click_next(self, page: Page, step_class: str = "") -> bool:
         """Try to click Next/Skip button on current step."""
@@ -1102,14 +1274,32 @@ class HypedditHandler(BaseGateHandler):
 
     async def _handle_final_download(self, page: Page, config: Config) -> str | None:
         """Handle the final download step."""
+        import asyncio as _asyncio
+
         logger.info("Attempting final download")
-
-        # Log all API requests so far for debugging
         self._dump_api_log()
-
         await random_delay(1000, 2000)
 
-        # Method 1: Try Playwright's download event with real click
+        output_dir = Path(config.download.output_dir)
+        output_dir.mkdir(parents=True, exist_ok=True)
+
+        # Strategy: Intercept the /gate/download/ul response to get the real download URL,
+        # then click the download button and wait for both the API response and download event.
+
+        download_api_body = []
+
+        async def intercept_download_response(response):
+            if "gate/download/ul" in response.url and response.status == 200:
+                try:
+                    body = await response.text()
+                    download_api_body.append(body)
+                    logger.info("Intercepted download API body: %s", body[:500])
+                except Exception as e:
+                    logger.debug("Could not read download response body: %s", e)
+
+        page.on("response", intercept_download_response)
+
+        # Method 1: Click download button + expect_download + intercept API response
         dl_selectors = [
             '.dw.current-slide a.free_dwln',
             '.dw.current-slide a.hype-btn-green',
@@ -1120,167 +1310,204 @@ class HypedditHandler(BaseGateHandler):
             '.dw a.hype-btn-green',
             '.dw a.hype-btn',
         ]
+
+        clicked_btn = None
         for sel in dl_selectors:
             try:
                 btn = await page.query_selector(sel)
                 if btn:
                     text = await btn.inner_text()
-                    href = await btn.get_attribute("href")
-                    onclick = await btn.get_attribute("onclick")
-                    logger.info("Download button: sel=%s text=%s href=%s onclick=%s",
-                                sel, text.strip(), href, onclick)
-                    try:
-                        async with page.expect_download(timeout=15000) as download_info:
-                            await btn.click(force=True)
-                        download = await download_info.value
-                        save_path = str(Path(config.download.output_dir) / download.suggested_filename)
-                        await download.save_as(save_path)
-                        logger.info("Downloaded: %s", save_path)
-                        return save_path
-                    except Exception as e:
-                        logger.warning("Download via %s failed: %s", sel, e)
+                    logger.info("Download button found: sel=%s text=%s", sel, text.strip())
+                    clicked_btn = btn
+                    break
             except Exception:
                 continue
 
-        # Method 2: Call the /gate/download/ul API directly
-        logger.info("Trying direct download API call...")
-        dl_url = await page.evaluate(f"""async () => {{
-            try {{
-                // Try the download API endpoint we found in network logs
-                const gateId = document.querySelector('#fan_gate_id')?.value || '{self._gate_id or ""}';
-                if (!gateId) return {{ error: 'no gate_id' }};
-
-                const formData = new FormData();
-                formData.append('fan_gate_id', gateId);
-
-                const response = await fetch('/gate/download/ul', {{
-                    method: 'POST',
-                    body: formData,
-                    credentials: 'include',
-                }});
-                const text = await response.text();
-                return {{ status: response.status, body: text.substring(0, 500) }};
-            }} catch(e) {{
-                return {{ error: e.message }};
-            }}
-        }}""")
-        logger.info("Download API response: %s", dl_url)
-
-        # If the API returned a URL, try to download it
-        if isinstance(dl_url, dict) and dl_url.get("body"):
-            body = dl_url["body"]
-            # Check if it's a direct URL
-            if body.startswith("http"):
-                logger.info("Got download URL from API: %s", body)
-                try:
-                    async with page.expect_download(timeout=30000) as download_info:
-                        await page.evaluate(f"window.location.href = '{body}'")
-                    download = await download_info.value
-                    save_path = str(Path(config.download.output_dir) / download.suggested_filename)
-                    await download.save_as(save_path)
-                    logger.info("Downloaded via API URL: %s", save_path)
-                    return save_path
-                except Exception as e:
-                    logger.warning("API URL download failed: %s", e)
-
-        # Method 3: Extract download URL from page source/scripts/onclick handlers
-        page_dl_url = await page.evaluate("""() => {
-            // Check onclick handlers of download buttons
-            const btns = document.querySelectorAll('.dw a, .current-slide a, a.free_dwln');
-            for (const btn of btns) {
-                const onclick = btn.getAttribute('onclick') || '';
-                // Look for URL in onclick
-                const match = onclick.match(/(https?:\/\/[^'"\\s]+)/);
-                if (match) return { source: 'onclick', url: match[1] };
-                // Check data attributes
-                for (const attr of btn.attributes) {
-                    if (attr.value && attr.value.startsWith('http') &&
-                        (attr.value.includes('download') || attr.value.includes('.mp3') ||
-                         attr.value.includes('.wav') || attr.value.includes('.zip'))) {
-                        return { source: 'data-attr', url: attr.value };
-                    }
-                }
-            }
-
-            // Check hidden inputs for download URLs
-            const inputs = document.querySelectorAll('input[type="hidden"]');
-            for (const input of inputs) {
-                if (input.value && (input.value.includes('.mp3') || input.value.includes('.wav') ||
-                    input.value.includes('.zip') || input.value.includes('/download'))) {
-                    return { source: 'hidden-input', url: input.value, id: input.id };
-                }
-            }
-
-            // Check inline scripts
-            const scripts = document.querySelectorAll('script:not([src])');
-            for (const script of scripts) {
-                const text = script.textContent;
-                const patterns = [
-                    /download_url\s*[:=]\s*['"](https?:\/\/[^'"]+)/,
-                    /file_url\s*[:=]\s*['"](https?:\/\/[^'"]+)/,
-                    /downloadFile\s*\(\s*['"](https?:\/\/[^'"]+)/,
-                ];
-                for (const pattern of patterns) {
-                    const match = text.match(pattern);
-                    if (match) return { source: 'script', url: match[1] };
-                }
-            }
-
-            return null;
-        }""")
-
-        if page_dl_url and page_dl_url.get("url"):
-            logger.info("Found download URL: source=%s url=%s", page_dl_url["source"], page_dl_url["url"])
+        if clicked_btn:
+            # Try expect_download first
             try:
-                async with page.expect_download(timeout=30000) as download_info:
-                    await page.goto(page_dl_url["url"])
+                async with page.expect_download(timeout=20000) as download_info:
+                    await clicked_btn.click(force=True)
                 download = await download_info.value
-                save_path = str(Path(config.download.output_dir) / download.suggested_filename)
+                save_path = str(output_dir / download.suggested_filename)
                 await download.save_as(save_path)
                 logger.info("Downloaded: %s", save_path)
+                page.remove_listener("response", intercept_download_response)
                 return save_path
             except Exception as e:
-                logger.error("Page source download failed: %s", e)
+                logger.info("expect_download timed out: %s", e)
 
-        # Method 4: Click download and watch for navigation/network
-        logger.info("Trying click + network monitoring...")
-        download_requests = []
+            # Download event failed. Wait a bit for the API response to arrive.
+            await random_delay(2000, 3000)
 
-        def capture_download_req(request):
-            url = request.url
-            if any(ext in url.lower() for ext in ['.mp3', '.wav', '.zip', '.flac', '/download']):
-                download_requests.append(url)
+            # Check if we got the download API response body
+            if download_api_body:
+                dl_url = self._extract_download_url(download_api_body[-1])
+                if dl_url:
+                    logger.info("Got download URL from intercepted API: %s", dl_url)
+                    result = await self._download_from_url(page, dl_url, output_dir)
+                    if result:
+                        page.remove_listener("response", intercept_download_response)
+                        return result
 
-        page.on("request", capture_download_req)
+        # Method 2: If button click triggered "DOWNLOAD STARTED" page,
+        # the JS already called the API. Check if we can find the URL in the page.
+        page_text = await page.evaluate("() => document.body?.innerText || ''")
+        if "download started" in page_text.lower():
+            logger.info("Page shows 'DOWNLOAD STARTED' - download was triggered by page JS")
+            # The download URL might be in the intercepted response
+            if download_api_body:
+                dl_url = self._extract_download_url(download_api_body[-1])
+                if dl_url:
+                    result = await self._download_from_url(page, dl_url, output_dir)
+                    if result:
+                        page.remove_listener("response", intercept_download_response)
+                        return result
 
-        # Click all download-like buttons
-        await page.evaluate("""() => {
-            const btns = document.querySelectorAll('a, button');
-            for (const btn of btns) {
-                const text = btn.textContent.trim().toLowerCase();
-                if (text.includes('download') && !text.includes('top 100')) {
-                    btn.click();
+        # Method 3: Manually POST to /gate/download/ul with full form data from the page
+        logger.info("Trying manual API call with full form data...")
+        dl_result = await page.evaluate("""async () => {
+            try {
+                // Collect all hidden input values (the page stores gate state in them)
+                const inputs = document.querySelectorAll('input[type="hidden"]');
+                const formData = new URLSearchParams();
+                for (const input of inputs) {
+                    if (input.name) formData.append(input.name, input.value);
                 }
+                formData.append('download_action', 'DOWNLOAD');
+                formData.append('download_visit', 'true');
+                formData.append('profile_downloads', 'true');
+
+                // Get CSRF token
+                let token = '';
+                const meta = document.querySelector('meta[name="csrf-token"]');
+                if (meta) token = meta.getAttribute('content');
+                if (!token) {
+                    const inp = document.querySelector('input[name="_token"]');
+                    if (inp) token = inp.value;
+                }
+
+                const headers = {
+                    'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8',
+                    'X-Requested-With': 'XMLHttpRequest',
+                    'Accept': 'application/json, text/javascript, */*; q=0.01',
+                };
+                if (token) headers['X-CSRF-TOKEN'] = token;
+
+                const response = await fetch('/gate/download/ul', {
+                    method: 'POST',
+                    body: formData.toString(),
+                    credentials: 'include',
+                    headers: headers,
+                });
+                const text = await response.text();
+                return { status: response.status, body: text.substring(0, 2000) };
+            } catch(e) {
+                return { error: e.message };
             }
         }""")
+        logger.info("Manual API result: %s", dl_result)
 
-        await random_delay(5000, 8000)
+        if isinstance(dl_result, dict) and dl_result.get("body"):
+            dl_url = self._extract_download_url(dl_result["body"])
+            if dl_url:
+                result = await self._download_from_url(page, dl_url, output_dir)
+                if result:
+                    page.remove_listener("response", intercept_download_response)
+                    return result
 
-        page.remove_listener("request", capture_download_req)
-
-        if download_requests:
-            logger.info("Captured download URLs from network: %s", download_requests)
-            for url in download_requests:
-                try:
-                    async with page.expect_download(timeout=30000) as download_info:
-                        await page.goto(url)
-                    download = await download_info.value
-                    save_path = str(Path(config.download.output_dir) / download.suggested_filename)
-                    await download.save_as(save_path)
-                    logger.info("Downloaded from network capture: %s", save_path)
-                    return save_path
-                except Exception as e:
-                    logger.warning("Network capture download failed for %s: %s", url, e)
-
+        page.remove_listener("response", intercept_download_response)
         logger.error("All download methods failed")
+        return None
+
+    def _extract_download_url(self, body: str) -> str | None:
+        """Extract a download URL from an API response body."""
+        import json as _json
+        import re as _re
+
+        body = body.strip()
+
+        # Check if it's a direct URL
+        if body.startswith("http"):
+            return body.split()[0].strip('"\'')
+
+        # Try JSON
+        try:
+            data = _json.loads(body)
+            # Common JSON response fields for download URLs
+            for key in ("url", "download_url", "file_url", "link", "redirect", "location"):
+                if key in data and isinstance(data[key], str) and data[key].startswith("http"):
+                    return data[key]
+            # Check nested
+            if isinstance(data, dict):
+                for v in data.values():
+                    if isinstance(v, str) and v.startswith("http") and any(
+                        ext in v.lower() for ext in [".mp3", ".wav", ".zip", ".flac", "download"]
+                    ):
+                        return v
+        except (ValueError, TypeError):
+            pass
+
+        # Regex for URLs in HTML/text
+        urls = _re.findall(r'https?://[^\s"\'<>]+', body)
+        for url in urls:
+            if any(ext in url.lower() for ext in [".mp3", ".wav", ".zip", ".flac", "download", "s3.amazonaws"]):
+                return url
+
+        if urls:
+            logger.info("Found URLs in response but none look like downloads: %s", urls[:5])
+
+        return None
+
+    async def _download_from_url(self, page: Page, url: str, output_dir: Path) -> str | None:
+        """Download a file from a direct URL."""
+        import httpx
+
+        logger.info("Downloading from URL: %s", url)
+
+        # Method A: Try Playwright download
+        try:
+            async with page.expect_download(timeout=30000) as download_info:
+                await page.evaluate(f"window.open('{url}', '_blank')")
+            download = await download_info.value
+            save_path = str(output_dir / download.suggested_filename)
+            await download.save_as(save_path)
+            logger.info("Downloaded via Playwright: %s", save_path)
+            return save_path
+        except Exception as e:
+            logger.info("Playwright download failed: %s", e)
+
+        # Method B: Direct HTTP download using cookies from browser
+        try:
+            cookies = await page.context.cookies()
+            cookie_header = "; ".join(f"{c['name']}={c['value']}" for c in cookies if "hypeddit" in c.get("domain", ""))
+
+            async with httpx.AsyncClient(follow_redirects=True, timeout=60.0) as client:
+                resp = await client.get(url, headers={
+                    "Cookie": cookie_header,
+                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+                })
+                if resp.status_code == 200 and len(resp.content) > 1000:
+                    # Determine filename from Content-Disposition or URL
+                    filename = None
+                    cd = resp.headers.get("content-disposition", "")
+                    if "filename=" in cd:
+                        import re as _re
+                        match = _re.search(r'filename[*]?=["\']?([^"\';\n]+)', cd)
+                        if match:
+                            filename = match.group(1).strip()
+                    if not filename:
+                        from urllib.parse import urlparse, unquote
+                        filename = unquote(urlparse(url).path.split("/")[-1]) or "download.mp3"
+
+                    save_path = str(output_dir / filename)
+                    with open(save_path, "wb") as f:
+                        f.write(resp.content)
+                    logger.info("Downloaded via httpx: %s (%d bytes)", save_path, len(resp.content))
+                    return save_path
+                else:
+                    logger.warning("HTTP download: status=%d size=%d", resp.status_code, len(resp.content))
+        except Exception as e:
+            logger.warning("httpx download failed: %s", e)
+
         return None
