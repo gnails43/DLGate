@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import logging
 import random
+import re
 from pathlib import Path
+from urllib.parse import parse_qs, unquote, urlparse
 
 from playwright.async_api import Page
 
@@ -91,7 +93,48 @@ class HypedditHandler(BaseGateHandler):
         self._is_skippable: bool = True
 
     async def can_handle(self, url: str) -> bool:
-        return "hypeddit.com" in url
+        return "hypeddit.com" in url or "gate.sc" in url
+
+    @staticmethod
+    def _resolve_gate_url(url: str) -> str:
+        """Resolve gate.sc redirect URLs and other wrappers to actual Hypeddit URLs.
+
+        gate.sc wraps URLs like: https://gate.sc/?url=https%3A%2F%2Fhypeddit.com%2F...
+        """
+        parsed = urlparse(url)
+        # gate.sc redirect
+        if "gate.sc" in parsed.netloc:
+            qs = parse_qs(parsed.query)
+            if "url" in qs:
+                resolved = unquote(qs["url"][0])
+                logger.info("Resolved gate.sc URL: %s -> %s", url[:60], resolved[:80])
+                return resolved
+        return url
+
+    def _generate_email_alias(self, base_email: str) -> str:
+        """Generate a unique email alias by inserting random dots in the local part.
+
+        Gmail ignores dots in the local part, so g.na.k@gmail.com delivers
+        to gnak@gmail.com, but Hypeddit treats them as different addresses.
+        This avoids the "attempts over" rate limit per email.
+
+        Note: + addressing (user+tag@) is rejected by Hypeddit's validator.
+        """
+        local, domain = base_email.split("@", 1)
+        # Strip existing dots and + tags for a clean base
+        local = local.split("+")[0].replace(".", "")
+        if len(local) < 2:
+            return base_email
+        # Insert dots at random positions (but never at start/end or consecutive)
+        positions = sorted(random.sample(range(1, len(local)), min(random.randint(1, 3), len(local) - 1)))
+        parts = []
+        prev = 0
+        for pos in positions:
+            parts.append(local[prev:pos])
+            prev = pos
+        parts.append(local[prev:])
+        dotted = ".".join(parts)
+        return f"{dotted}@{domain}"
 
     async def process(self, page: Page, track: Track, config: Config) -> GateResult:
         result = GateResult(track=track)
@@ -99,6 +142,8 @@ class HypedditHandler(BaseGateHandler):
         self._retried_download = False
 
         try:
+            # Resolve gate.sc redirect URLs to actual Hypeddit URLs
+            gate_url = self._resolve_gate_url(gate_url)
             logger.info("Processing Hypeddit gate: %s", gate_url)
 
             # Set up network request interception BEFORE loading the page
@@ -199,8 +244,9 @@ class HypedditHandler(BaseGateHandler):
                     await random_delay(1000, 2000)
 
                 elif screen == "download_ready":
-                    # Before attempting download, ensure all steps are marked
-                    # as skip_gate_steps to maximize chances of server accepting
+                    # Check server-side pathway to find missing steps
+                    await self._complete_missing_steps(page, config, result)
+                    # Then mark all steps as skipped (server + client)
                     await self._mark_all_steps_skipped(page)
                     download_path = await self._handle_final_download(page, config)
                     if download_path:
@@ -338,16 +384,49 @@ class HypedditHandler(BaseGateHandler):
         }""")
 
     async def _mark_all_steps_skipped(self, page: Page) -> None:
-        """Add skip_gate_steps hidden inputs for all step types.
+        """Register all gate steps as skipped both server-side and client-side.
 
-        This tells the download API that all intermediate steps can be skipped.
-        Some gates already have these inputs pre-set by the gate creator.
+        1. Call /setGatePathwayOr for each step type in steps_select (server-side)
+        2. Add skip_gate_steps[] hidden inputs (client-side, for DL form submission)
         """
+        # Server-side: register each step as skipped via API
+        steps = (self._steps or "").split(",")
+        step_types = [s for s in steps if s and s != "dw"]
+
+        if self._gate_id and step_types:
+            csrf_token = self._csrf_token or ""
+            for step in step_types:
+                skip_result = await page.evaluate(f"""async () => {{
+                    try {{
+                        let token = '{csrf_token}';
+                        if (!token) {{
+                            const meta = document.querySelector('meta[name="csrf-token"]');
+                            if (meta) token = meta.getAttribute('content');
+                        }}
+                        const fd = new URLSearchParams();
+                        fd.append('fan_gate_id', '{self._gate_id}');
+                        fd.append('skipSteps[]', '{step}');
+                        fd.append('selectedStep', '{step}');
+                        const r = await fetch('/setGatePathwayOr', {{
+                            method: 'POST', body: fd.toString(), credentials: 'include',
+                            headers: {{
+                                'Content-Type': 'application/x-www-form-urlencoded',
+                                'X-Requested-With': 'XMLHttpRequest',
+                                'X-CSRF-TOKEN': token,
+                            }},
+                        }});
+                        return {{ status: r.status, body: (await r.text()).substring(0, 100) }};
+                    }} catch(e) {{
+                        return {{ status: 0, body: 'error: ' + e.message }};
+                    }}
+                }}""")
+                logger.info("Pre-download skip %s: status=%s", step, skip_result.get("status"))
+
+        # Client-side: add hidden inputs for download form
         result = await page.evaluate("""() => {
             const stepTypes = ['email', 'sc', 'ig', 'tk', 'sp', 'yt', 'fb', 'tw', 'am'];
             const added = [];
             for (const step of stepTypes) {
-                // Don't add if already exists
                 const existing = document.querySelector(`input[name="skip_gate_steps[]"][value="${step}"]`);
                 if (!existing) {
                     const input = document.createElement('input');
@@ -360,7 +439,6 @@ class HypedditHandler(BaseGateHandler):
                     added.push(step);
                 }
             }
-            // Also collect existing skip inputs
             const existing = Array.from(document.querySelectorAll('input[name="skip_gate_steps[]"]'))
                 .map(el => el.value);
             return { added, existing };
@@ -487,70 +565,160 @@ class HypedditHandler(BaseGateHandler):
         logger.info("Fallback click: %s", clicked)
 
     async def _handle_email(self, page: Page, config: Config) -> None:
-        """Handle email input step."""
+        """Handle email input step.
+
+        Uses dot-alias addressing to avoid Hypeddit's per-email rate limit.
+        Gmail ignores dots, so g.nak@gmail.com delivers to gnak@gmail.com.
+
+        Important: Do NOT call /verifyEmailAddress API directly — let the
+        jQuery click handler on the submit button do it. Calling the API
+        ourselves first consumes the attempt counter, then the button's
+        handler gets "attempts over" and fails to register completion.
+        """
         logger.info("Filling email form")
 
-        # Use Playwright fill() for proper event triggering
-        try:
-            name_input = await page.query_selector('#email_name')
-            if name_input:
-                await name_input.fill(config.user.name)
-                logger.info("Filled name: %s", config.user.name)
-        except Exception:
-            await js_fill(page, "#email_name", config.user.name)
-            logger.info("Filled name (JS fallback): %s", config.user.name)
+        # Generate a unique email alias to avoid "attempts over" rate limiting
+        email = self._generate_email_alias(config.user.email)
+        logger.info("Using email alias: %s (base: %s)", email, config.user.email)
 
-        try:
-            email_input = await page.query_selector('#email_address')
-            if email_input:
-                await email_input.fill(config.user.email)
-                logger.info("Filled email: %s", config.user.email)
-        except Exception:
-            await js_fill(page, "#email_address", config.user.email)
-            logger.info("Filled email (JS fallback): %s", config.user.email)
+        # Fill via JS (.value set) since the email slide may not be visible
+        await js_fill(page, "#email_name", config.user.name)
+        logger.info("Filled name: %s", config.user.name)
+
+        await js_fill(page, "#email_address", email)
+        logger.info("Filled email: %s", email)
 
         await random_delay(500, 1000)
 
-        # Also register email via API directly (ensures server-side registration)
-        if self._gate_id and self._csrf_token:
-            email_result = await page.evaluate(f"""async () => {{
-                try {{
-                    const fd = new URLSearchParams();
-                    fd.append('validateEmailAddress', {repr(config.user.email)});
-                    fd.append('fan_gate_id', '{self._gate_id}');
-                    fd.append('email_name', {repr(config.user.name)});
-                    fd.append('adcode', '');
-                    fd.append('hypesource', '');
-                    const r = await fetch('/verifyEmailAddress', {{
-                        method: 'POST', body: fd.toString(), credentials: 'include',
-                        headers: {{
-                            'Content-Type': 'application/x-www-form-urlencoded',
-                            'X-Requested-With': 'XMLHttpRequest',
-                            'X-CSRF-TOKEN': '{self._csrf_token}',
-                        }},
-                    }});
-                    return await r.text();
-                }} catch(e) {{
-                    return 'error: ' + e.message;
-                }}
-            }}""")
-            logger.info("Email API: %s", str(email_result)[:200])
+        # Do NOT call /verifyEmailAddress API here — the button's jQuery
+        # click handler calls it internally. If we call it first, we consume
+        # the "attempt" and the handler gets "attempts over".
 
-        # Use Playwright real click on submit button (not JS click)
+        # Intercept the verifyEmailAddress response to log the result
+        email_api_result = []
+        async def capture_email_response(response):
+            if "verifyEmailAddress" in response.url:
+                try:
+                    body = await response.text()
+                    email_api_result.append(body)
+                    logger.info("Email API (from button handler): %s", body[:200])
+                except Exception:
+                    pass
+
+        page.on("response", capture_email_response)
+
+        # NOTE: We don't call /verifyEmailAddress here anymore.
+        # Instead, we rely on the jQuery click handler below.
+        email_result = "skipped (let button handler do it)"
+        # Legacy log line kept for compatibility:
+        logger.info("Email API: %s", str(email_result)[:200])
+
+        # Click submit button — the jQuery handler will call /verifyEmailAddress
+        # and if successful, will call jumpGate() to advance + register completion.
+        clicked = False
         try:
             btn = await page.query_selector('#email_to_downloads_next')
             if btn:
                 await btn.click(force=True)
                 logger.info("Clicked email submit (Playwright real click)")
-                await random_delay(2000, 3000)
-                return
+                clicked = True
         except Exception as e:
             logger.debug("Playwright email submit failed: %s", e)
 
-        # Fallback: try JS click
-        if await js_click(page, "#email_to_downloads_next"):
-            logger.info("Clicked email submit (JS fallback)")
-            await random_delay(2000, 3000)
+        if not clicked:
+            if await js_click(page, "#email_to_downloads_next"):
+                logger.info("Clicked email submit (JS fallback)")
+                clicked = True
+
+        if clicked:
+            # Wait for jQuery handler to call /verifyEmailAddress and process
+            await random_delay(4000, 6000)
+            # Log captured email API response
+            if email_api_result:
+                logger.info("Email verify result: %s", email_api_result[-1][:200])
+            else:
+                logger.warning("No email API response captured after button click")
+
+        # Clean up response listener
+        try:
+            page.remove_listener("response", capture_email_response)
+        except Exception:
+            pass
+
+    async def _complete_missing_steps(self, page: Page, config: Config, result: GateResult) -> None:
+        """Check server-side pathway and complete any steps that were skipped client-side.
+
+        When Hypeddit's JS auto-advances past steps (e.g. SC OAuth already done
+        in browser), the server may not have recorded those completions. This
+        method queries /getGatePathway and fills in the gaps.
+        """
+        if not self._gate_id:
+            return
+
+        csrf_token = self._csrf_token or ""
+        steps = (self._steps or "").split(",")
+        step_types = [s for s in steps if s and s != "dw"]
+
+        # Query server for which steps are already completed
+        pathway = await page.evaluate(f"""async () => {{
+            try {{
+                const fd = new URLSearchParams();
+                fd.append('fan_gate_id', '{self._gate_id}');
+                const r = await fetch('/getGatePathway', {{
+                    method: 'POST', body: fd.toString(), credentials: 'include',
+                    headers: {{
+                        'Content-Type': 'application/x-www-form-urlencoded',
+                        'X-Requested-With': 'XMLHttpRequest',
+                        'X-CSRF-TOKEN': '{csrf_token}',
+                    }},
+                }});
+                return await r.json();
+            }} catch(e) {{
+                return {{ error: e.message }};
+            }}
+        }}""")
+        logger.info("getGatePathway before download: %s", pathway)
+
+        completed = set()
+        if isinstance(pathway, dict):
+            skip_steps = pathway.get("skip_gate_steps", [])
+            if isinstance(skip_steps, list):
+                completed = set(skip_steps)
+
+        missing = [s for s in step_types if s not in completed]
+        if not missing:
+            logger.info("All steps completed server-side")
+            return
+
+        logger.info("Missing steps server-side: %s (completed: %s)", missing, completed)
+
+        # Complete missing steps
+        for step in missing:
+            if step == "sc" and GateStepType.SOUNDCLOUD_OAUTH not in result.steps_completed:
+                logger.info("Completing missing SC OAuth step")
+                await self._handle_soundcloud(page, config)
+                result.steps_completed.append(GateStepType.SOUNDCLOUD_OAUTH)
+            elif step == "email" and GateStepType.EMAIL not in result.steps_completed:
+                logger.info("Completing missing email step")
+                await self._handle_email(page, config)
+                result.steps_completed.append(GateStepType.EMAIL)
+            else:
+                # For social steps (ig, sp, tk, etc), call /setGatePathwayOr
+                logger.info("Registering missing step '%s' via API", step)
+                await page.evaluate(f"""async () => {{
+                    const fd = new URLSearchParams();
+                    fd.append('fan_gate_id', '{self._gate_id}');
+                    fd.append('skipSteps[]', '{step}');
+                    fd.append('selectedStep', '{step}');
+                    await fetch('/setGatePathwayOr', {{
+                        method: 'POST', body: fd.toString(), credentials: 'include',
+                        headers: {{
+                            'Content-Type': 'application/x-www-form-urlencoded',
+                            'X-Requested-With': 'XMLHttpRequest',
+                            'X-CSRF-TOKEN': '{csrf_token}',
+                        }},
+                    }});
+                }}""")
 
     async def _handle_soundcloud(self, page: Page, config: Config) -> None:
         """Handle SoundCloud step (comment + Connect via OAuth).
@@ -867,14 +1035,27 @@ class HypedditHandler(BaseGateHandler):
             except Exception as e:
                 logger.warning("Facebook login flow failed: %s", e)
 
-        elif "authorize" in page_text.lower() or "connect" in page_text.lower():
-            # Authorization page - click Connect/Authorize
-            logger.info("SC OAuth shows authorization page, clicking Connect")
+        elif "authorize" in page_text.lower() or "connect" in page_text.lower() or "allow" in page_text.lower() or "access" in page_text.lower():
+            # Authorization page - click Allow/Connect/Authorize
+            logger.info("SC OAuth shows authorization page, clicking Allow")
             try:
-                auth_btn = popup.locator('button:has-text("Connect"), button:has-text("Authorize")').first
-                if await auth_btn.count() > 0:
+                # Try #submit_approval first (SC's actual Allow button ID)
+                auth_btn = await popup.query_selector('#submit_approval')
+                if auth_btn:
                     await auth_btn.click()
-                    logger.info("Clicked Connect/Authorize button")
+                    logger.info("Clicked #submit_approval (Allow) button")
+                else:
+                    # Fallback: search by text
+                    auth_btn = popup.locator('button:has-text("Allow"), button:has-text("Connect"), button:has-text("Authorize")').first
+                    if await auth_btn.count() > 0:
+                        await auth_btn.click()
+                        logger.info("Clicked Allow/Connect/Authorize button")
+                    else:
+                        # Last resort: click submit button
+                        submit = await popup.query_selector('button[type="submit"]')
+                        if submit:
+                            await submit.click()
+                            logger.info("Clicked submit button")
             except Exception as e:
                 logger.warning("Could not click authorize button: %s", e)
 
@@ -1166,29 +1347,67 @@ class HypedditHandler(BaseGateHandler):
         else:
             logger.warning("API skip failed, CSS advance may cause download to fail")
 
-        css_result = await page.evaluate("""() => {
+        # Use steps_select to find the correct next step
+        steps_select = self._steps or ""
+        css_result = await page.evaluate(f"""() => {{
             const current = document.querySelector('.fangate-slider-content.current-slide');
+            if (!current) return 'no current slide';
+
+            // Get the step order from steps_select (e.g. "dw,email,sc,ig")
+            const stepsOrder = '{steps_select}'.split(',').filter(s => s && s !== 'dw');
+            const stepTypes = ['sc', 'ig', 'tk', 'sp', 'yt', 'fb', 'tw', 'am', 'email', 'dw'];
+
+            // Find current step type
+            const currentType = Array.from(current.classList).find(c => stepTypes.includes(c));
+            const currentIdx = stepsOrder.indexOf(currentType);
+
+            // First try: use upcomming-slide if it exists
             const upcoming = document.querySelector('.fangate-slider-content.upcomming-slide');
-            if (!current || !upcoming) {
-                // Try finding next sibling slide
-                if (current) {
-                    const next = current.nextElementSibling;
-                    if (next && next.classList.contains('fangate-slider-content')) {
-                        current.classList.remove('current-slide', 'zindex');
-                        current.classList.add('move-left');
-                        next.classList.remove('upcomming-slide');
-                        next.classList.add('current-slide', 'zindex');
-                        return 'CSS advanced via sibling';
-                    }
-                }
-                return 'no slides to advance';
-            }
-            current.classList.remove('current-slide', 'zindex');
-            current.classList.add('move-left');
-            upcoming.classList.remove('upcomming-slide');
-            upcoming.classList.add('current-slide', 'zindex');
-            return 'CSS advanced';
-        }""")
+            if (current && upcoming) {{
+                current.classList.remove('current-slide', 'zindex');
+                current.classList.add('move-left');
+                upcoming.classList.remove('upcomming-slide');
+                upcoming.classList.add('current-slide', 'zindex');
+                const nextType = Array.from(upcoming.classList).find(c => stepTypes.includes(c));
+                return 'CSS advanced to ' + (nextType || 'unknown');
+            }}
+
+            // Second try: use steps_select order to find next step's slide
+            if (currentIdx >= 0 && currentIdx < stepsOrder.length - 1) {{
+                const nextStepType = stepsOrder[currentIdx + 1];
+                const nextSlide = document.querySelector('.fangate-slider-content.' + nextStepType);
+                if (nextSlide) {{
+                    current.classList.remove('current-slide', 'zindex');
+                    current.classList.add('move-left');
+                    nextSlide.classList.remove('upcomming-slide');
+                    nextSlide.classList.add('current-slide', 'zindex');
+                    return 'CSS advanced via steps_select to ' + nextStepType;
+                }}
+            }}
+
+            // Third try: next step is 'dw' (download)
+            const dwSlide = document.querySelector('.fangate-slider-content.dw');
+            if (dwSlide && dwSlide !== current) {{
+                current.classList.remove('current-slide', 'zindex');
+                current.classList.add('move-left');
+                dwSlide.classList.remove('upcomming-slide');
+                dwSlide.classList.add('current-slide', 'zindex');
+                return 'CSS advanced to dw (download)';
+            }}
+
+            // Last resort: next sibling
+            const next = current.nextElementSibling;
+            if (next && next.classList.contains('fangate-slider-content')) {{
+                current.classList.remove('current-slide', 'zindex');
+                current.classList.add('move-left');
+                next.classList.remove('upcomming-slide');
+                next.classList.add('current-slide', 'zindex');
+                const nextType = Array.from(next.classList).find(c => stepTypes.includes(c));
+                return 'CSS advanced via sibling to ' + (nextType || 'unknown');
+            }}
+
+            return 'no slides to advance';
+        }}""")
         logger.info("CSS advance: %s", css_result)
         await random_delay(500, 1000)
         return 'CSS advanced' in str(css_result)
