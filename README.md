@@ -1,90 +1,82 @@
-# 設計を理解しながらWebアプリを開発【はじめてのWeb開発】【Flask】
+# DLGate
 
-こちらはぐり主任がUdemyで公開している「設計を理解しながらWebアプリを開発【はじめてのWeb開発】【Flask】」のリポジトリです。
+SoundCloud / Hypeddit のダウンロードゲートを自動処理して楽曲をダウンロードするツール。
 
-詳細は[Udemyのコース](https://www.udemy.com/course/flask_memo/?referralCode=BD7134D728DFC04E8273)をご覧ください。
+## コンポーネント
 
-[GitHubリポジトリはこちら](https://github.com/gurishunin/udemy_flask_memo)
+1. **Chrome拡張** — SoundCloud/Hypedditページに「+ DL List」ボタンを追加。DL対象をリスト管理・JSONエクスポート
+2. **Python CLI** — エクスポートしたJSONを読み込み、Playwrightでゲートを自動通過して楽曲をDL
 
-## コマンド一覧
-### 仮想環境の構築
-#### macOS/Linux
-```
-mkdir myproject
-cd myproject
-python3 -m venv venv
-```
-#### Windows
-```
-mkdir myproject
-cd myproject
-py -3 -m venv venv
-```
-### 仮想環境の有効化
-#### macOS/Linux
-```
-. venv/bin/activate
-```
-#### Windows
-```
-venv\Scripts\activate
-```
-### Flaskのインストール
-```
-pip install Flask
-```
-### プログラムの実行コマンド
-#### Mac(Bash)
-```
-export FLASK_APP=app
-export FLASK_ENV=development
-flask run
-```
-#### Windows(CMD)※コマンドプロンプト
-```
-set FLASK_APP=app
-set FLASK_ENV=development
-flask run
-```
-#### Windows(PowerShell)
-```
-$env:FLASK_APP = “app“
-$env: FLASK_ENV = “development“
-flask run
+## セットアップ
+
+### Python CLI
+
+```bash
+pip install -e .
+playwright install chromium
+cp config.example.yaml config.yaml
+# config.yaml を編集（名前・メール等）
 ```
 
-### Flask-loginのインストール
+### Chrome拡張
+
+1. Chrome で `chrome://extensions` を開く
+2. 「デベロッパーモード」をON
+3. 「パッケージ化されていない拡張機能を読み込む」→ `extension/` フォルダを選択
+
+## 使い方
+
+### 1. 初回セットアップ（SNSログイン）
+
+```bash
+dlgate setup
 ```
-pip install flask-login
+
+ブラウザが開くので、SoundCloud・Spotify・Instagram・TikTok・YouTubeにログイン。完了したらターミナルでEnter。
+
+### 2. DLリストにトラックを追加
+
+SoundCloudでトラックページを開き、「+ DL List」ボタンをクリック。Hypedditページでも同様。
+
+### 3. リストをエクスポート
+
+Chrome拡張のポップアップで「Export JSON」をクリック。
+
+### 4. 一括ダウンロード
+
+```bash
+dlgate process dlgate-list-20260322.json
 ```
 
+## ゲート対応状況
 
-## ソースコード対応表
-| セクション名 | レクチャー名                                 | ブランチ名     | 
-| ------------|-------------------------------------------- | ------------- | 
-| 【基礎】Webサーバを構築しよう！ | HelloWorld_プログラム作成 | 01_01_hello |
-| 【基礎】Webサーバを構築しよう！ | ルーティング_実装 | 01_02_routing |
-| 【基礎】Webサーバを構築しよう！ | ルーティング変数_実装 | 01_03_routing_2|
-| 【基礎】Webサーバを構築しよう！ | 画面(HTML)テンプレート_実装 | 01_04_templates|
-| 【基礎】Webサーバを構築しよう！ | 画面内条件分岐_実装 | 01_05_templates_2|
-| 【開発】top画面を作ろう！ | - | 02_top|
-| 【開発】DBの基礎を学ぼう！ | - | 03_top_db|
-| 【開発】新規登録画面／機能を作ろう！ | - | 04_regist|
-| 【開発】編集画面／機能を作ろう！ | - | 05_edit|
-| 【開発】削除画面／機能を作ろう！ | - | 06_delete|
-| 【開発】ログイン画面／機能を作ろう！①（DBなしで仕組みを作る） | - | 07_login|
-| 【開発】ログイン画面／機能を作ろう！②（DB利用） | 完成版 | main|
+| ゲート | ステップ | 対応 |
+|--------|---------|------|
+| Hypeddit | メール入力 | ✅ |
+| | SoundCloud OAuth | ✅ |
+| | コメント | ✅ |
+| | SNSリンク (Spotify/Instagram/TikTok/YouTube等) | ✅ |
+| | ダウンロード | ✅ |
 
-## 各種リンク
-[python公式ページ](https://www.python.org/downloads/)
+## 設定（config.yaml）
 
-[Flaskの公式ページ（英語）](https://flask.palletsprojects.com/en/latest/)
+```yaml
+user:
+  name: "Your Name"
+  email: "your@email.com"
 
-[Flaskの公式ページ（日本語）](https://msiz07-flask-docs-ja.readthedocs.io/ja/latest/)
+comments:
+  - "Great track!"
+  - "Yeah"
+  - "Nice one"
 
-[VScode](https://code.visualstudio.com/download)
+download:
+  output_dir: "./downloads"
+  skip_existing: true
 
-[SQLite](https://www.sqlite.org/download.html)
-
-[Flask-loginの公式ページ](https://flask-login.readthedocs.io/en/latest/)
-
+browser:
+  profile_dir: "./.browser_profile"
+  headless: false
+  slow_mo: 100
+  timeout: 30000
+```

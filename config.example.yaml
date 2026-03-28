@@ -1,0 +1,22 @@
+user:
+  name: "Your Name"
+  email: "your@email.com"
+
+comments:
+  - "Great track!"
+  - "Yeah"
+  - "Nice one"
+  - "Fire"
+  - "Love this"
+  - "Dope"
+  - "Sick"
+
+download:
+  output_dir: "./downloads"
+  skip_existing: true
+
+browser:
+  profile_dir: "./.browser_profile"
+  headless: false
+  slow_mo: 100
+  timeout: 30000

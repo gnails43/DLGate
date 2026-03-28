@@ -1,0 +1,23 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <link rel="stylesheet" href="popup.css" />
+  </head>
+  <body>
+    <div class="header">
+      <h1>DLGate</h1>
+      <span id="count" class="badge">0</span>
+    </div>
+    <div id="list" class="list"></div>
+    <div id="empty" class="empty" style="display: none">
+      No tracks in list.<br />Visit SoundCloud and click "+ DL List" to add
+      tracks.
+    </div>
+    <div class="actions">
+      <button id="exportBtn" class="btn btn-primary">Export JSON</button>
+      <button id="clearBtn" class="btn btn-danger">Clear All</button>
+    </div>
+    <script src="popup.js"></script>
+  </body>
+</html>
