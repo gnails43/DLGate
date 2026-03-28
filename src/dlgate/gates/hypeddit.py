@@ -177,6 +177,11 @@ class HypedditHandler(BaseGateHandler):
             await self._dismiss_cookies(page)
             await random_delay(500, 1000)
 
+            # Clear Hypeddit's email attempt counter cookie to avoid rate limit
+            await page.evaluate("""() => {
+                document.cookie = 'teb3456767win=; expires=Thu, 01 Jan 1970 00:00:00 UTC; path=/;';
+            }""")
+
             # Extract gate metadata
             await self._extract_gate_metadata(page)
 
@@ -613,22 +618,23 @@ class HypedditHandler(BaseGateHandler):
         # Legacy log line kept for compatibility:
         logger.info("Email API: %s", str(email_result)[:200])
 
-        # Click submit button — the jQuery handler will call /verifyEmailAddress
-        # and if successful, will call jumpGate() to advance + register completion.
-        clicked = False
-        try:
-            btn = await page.query_selector('#email_to_downloads_next')
-            if btn:
-                await btn.click(force=True)
-                logger.info("Clicked email submit (Playwright real click)")
-                clicked = True
-        except Exception as e:
-            logger.debug("Playwright email submit failed: %s", e)
-
-        if not clicked:
-            if await js_click(page, "#email_to_downloads_next"):
-                logger.info("Clicked email submit (JS fallback)")
-                clicked = True
+        # Click submit button — MUST use jQuery .trigger('click') to fire the
+        # jQuery-bound handler. Native DOM .click() and Playwright .click()
+        # do NOT trigger jQuery handlers reliably on this element.
+        clicked = await page.evaluate("""() => {
+            if (typeof jQuery !== 'undefined') {
+                jQuery('#email_to_downloads_next').trigger('click');
+                return 'jquery_trigger';
+            } else if (typeof $ !== 'undefined') {
+                $('#email_to_downloads_next').trigger('click');
+                return 'jquery_trigger_$';
+            }
+            // Fallback: native click
+            const btn = document.querySelector('#email_to_downloads_next');
+            if (btn) { btn.click(); return 'native_click'; }
+            return null;
+        }""")
+        logger.info("Email submit click method: %s", clicked)
 
         if clicked:
             # Wait for jQuery handler to call /verifyEmailAddress and process

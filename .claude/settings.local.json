@@ -11,7 +11,26 @@
       "Bash(powershell -Command \"Get-ChildItem ''C:\\\\GitHub\\\\.git\\\\worktrees\\\\vigilant-ramanujan\\\\'' -Filter ''index*'' | Select-Object Name, Length, LastWriteTime\")",
       "Bash(powershell -Command \"Test-Path ''C:\\\\GitHub\\\\.git\\\\worktrees\\\\vigilant-ramanujan\\\\index.lock''\")",
       "Bash(GIT_DIR=\"C:/GitHub/DLGate/.git/worktrees/vigilant-ramanujan\" git -C \"C:\\\\GitHub\\\\DLGate\\\\.claude\\\\worktrees\\\\vigilant-ramanujan\" status)",
-      "Bash(powershell -Command \"& { $lockPath = ''C:\\\\GitHub\\\\.git\\\\worktrees\\\\vigilant-ramanujan\\\\index.lock''; Write-Host \\(''Exists: '' + \\(Test-Path $lockPath\\)\\); if \\(Test-Path $lockPath\\) { Get-Item $lockPath | Select-Object FullName, Length, LastWriteTime, Attributes; try { [System.IO.File]::Delete\\($lockPath\\); Write-Host ''Deleted'' } catch { Write-Host $_.Exception.Message } } }\")"
+      "Bash(powershell -Command \"& { $lockPath = ''C:\\\\GitHub\\\\.git\\\\worktrees\\\\vigilant-ramanujan\\\\index.lock''; Write-Host \\(''Exists: '' + \\(Test-Path $lockPath\\)\\); if \\(Test-Path $lockPath\\) { Get-Item $lockPath | Select-Object FullName, Length, LastWriteTime, Attributes; try { [System.IO.File]::Delete\\($lockPath\\); Write-Host ''Deleted'' } catch { Write-Host $_.Exception.Message } } }\")",
+      "Bash(python -m venv .venv)",
+      "Bash(source .venv/Scripts/activate)",
+      "Bash(pip install:*)",
+      "Bash(playwright install:*)",
+      "Bash(dlgate --help)",
+      "Bash(dlgate setup:*)",
+      "Read(//c/Users/gnakf/AppData/Local/ms-playwright/chromium-1208/chrome-win64/**)",
+      "Read(//c/Users/gnakf/AppData/Local/ms-playwright/**)",
+      "Bash(python -c \":*)",
+      "Bash(git -C \"C:\\\\GitHub\\\\DLGate\" remote -v)",
+      "Bash(git --git-dir=\"C:\\\\GitHub\\\\.git\" remote -v)",
+      "Bash(gh auth:*)",
+      "Bash(where gh.exe)",
+      "Read(//c/Program Files/GitHub CLI/**)",
+      "Read(//c/Program Files \\(x86\\)/GitHub CLI/**)",
+      "Read(//c/GitHub/DLGate/.claude/worktrees/vigilant-ramanujan/$LOCALAPPDATA/Programs/GitHub CLI/**)",
+      "Bash(cmd.exe /c \"gh auth status\")",
+      "Bash(powershell -Command \"Get-Command gh -ErrorAction SilentlyContinue | Select-Object Source\")",
+      "Bash(dlgate -v process test-single.json)"
     ]
   }
 }
